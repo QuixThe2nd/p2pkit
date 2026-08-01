@@ -1,2 +1,4 @@
-// Public entry for `p2pkit`. `P2PKit` and `Peer` land in Phase 4/5.
-export {} // placeholder — replaced when core is implemented
+// Public entry for `p2pkit`.
+export { Peer, type PeerOptions, type PeerEvents } from "./core/Peer.js"
+
+// P2PKit (mesh orchestration) lands in Phase 5.

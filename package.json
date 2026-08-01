@@ -73,7 +73,12 @@
       "optional": true
     }
   },
+  "optionalDependencies": {
+    "@roamhq/wrtc": "^0.10.0",
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
+    "@roamhq/wrtc": "^0.10.0",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.18.1",
     "tsup": "^8.3.5",
