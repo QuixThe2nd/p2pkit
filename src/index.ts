@@ -1,4 +1,9 @@
 // Public entry for `p2pkit`.
+export {
+  P2PKit,
+  type P2PKitOptions,
+  type P2PKitEvents,
+  type BroadcastOptions,
+} from "./core/P2PKit.js"
 export { Peer, type PeerOptions, type PeerEvents } from "./core/Peer.js"
-
-// P2PKit (mesh orchestration) lands in Phase 5.
+export { Topic, type TopicOptions } from "./core/topic.js"

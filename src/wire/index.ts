@@ -81,6 +81,10 @@ export interface SubFrame {
   v: typeof WIRE_VERSION
   k: "sub" | "unsub"
   topic: string
+  /** The subscribing peer (preserved as the frame is gossiped onward). */
+  from: PeerId
+  /** Gossip dedup id. */
+  id: string
 }
 
 /** Topic publish, scoped to subscribers, with per-sender replay protection. */
@@ -89,10 +93,12 @@ export interface PubFrame {
   k: "pub"
   topic: string
   from: PeerId
-  /** Per-sender monotonically increasing sequence number. */
+  /** Per-sender monotonically increasing sequence number (also the relay dedup key). */
   seq: number
   /** Per-message nonce within the replay window. */
   nonce: string
+  /** Hop limit for relaying toward subscribers. */
+  ttl: number
   body: unknown
   /** Origin signature, present on `{ signed: true }` topics. */
   sig?: string
