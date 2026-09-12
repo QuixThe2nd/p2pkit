@@ -3,10 +3,17 @@ import type { Signer } from "../auth/signer.js"
 import type { Transport } from "../transports/types.js"
 import type { SignallingChannel } from "../signalling/types.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
-import type { Frame, MsgFrame, HelloFrame, AckFrame } from "../wire/index.js"
+import type { Frame, MsgFrame, HelloFrame, AckFrame, ReqFrame, ResFrame } from "../wire/index.js"
 import { WIRE_VERSION } from "../wire/index.js"
+import type { API } from "../rpc/api.js"
+import type { APISchema, RPCContext } from "../rpc/schema.js"
+import type { Router, DispatchResult } from "../rpc/router.js"
+import type { Client } from "../rpc/client.js"
+import { createClient } from "../rpc/client.js"
+import { RPCError } from "../rpc/error.js"
 import { Emitter } from "../utils/emitter.js"
 import { randomId } from "../utils/id.js"
+import { promiseWithTimeout, ErrorTimeout } from "../utils/timeout.js"
 import { NoopSigner } from "../auth/signer.js"
 import { ECDSASigner } from "../auth/ecdsa.js"
 import { encrypt, decrypt } from "../auth/crypto.js"
@@ -41,11 +48,16 @@ export interface PeerOptions<Msg = unknown> {
   encrypted?: boolean
   /** Capabilities to advertise in the handshake. */
   caps?: string[]
+  /** Serve this peer's RPC calls (README §2.1). Built from `api.router({...})`. */
+  router?: Router
+  /** Per-call RPC timeout in ms. Default 30000. */
+  rpcTimeout?: number
   /** Inject a ready transport instead of building an `RTCTransport` (advanced/testing). */
   transport?: Transport<Frame>
 }
 
 const PING_INTERVAL_MS = 5000
+const DEFAULT_RPC_TIMEOUT = 30_000
 
 /**
  * One authenticated connection to a single peer. Wraps a {@link Transport} with
@@ -72,6 +84,7 @@ export class Peer<Msg = unknown> {
   private _latency?: number
   private pingTimer?: ReturnType<typeof setInterval>
   private readonly pendingPings = new Map<string, number>()
+  private readonly pendingRPC = new Map<string, (result: DispatchResult) => void>()
   private readonly outbox: Frame[] = []
 
   /** Resolves once the connection is open (identity proven) or rejects on failure. */
@@ -125,6 +138,28 @@ export class Peer<Msg = unknown> {
       frame = { v: WIRE_VERSION, k: "msg", body: msg }
     }
     await this.sendFrame(frame)
+  }
+
+  /** A typed RPC client for calling this peer's methods (README §2.2). */
+  client<S extends APISchema>(api: API<S>): Client<S> {
+    return createClient(this, api, { timeout: this.options.rpcTimeout ?? DEFAULT_RPC_TIMEOUT })
+  }
+
+  /**
+   * Issue one RPC request and await the correlated response (satisfies
+   * `RPCRequester`). Resolves to the raw {@link DispatchResult}, or an
+   * {@link RPCError} on timeout — the client wraps this with validation.
+   */
+  async requestRPC(method: string, body: unknown, timeoutMs: number): Promise<DispatchResult | RPCError> {
+    const id = randomId(12)
+    const wait = new Promise<DispatchResult>(resolve => this.pendingRPC.set(id, resolve))
+    await this.sendFrame({ v: WIRE_VERSION, k: "req", id, method, body })
+    const result = await promiseWithTimeout(wait, timeoutMs)
+    if (result instanceof ErrorTimeout) {
+      this.pendingRPC.delete(id)
+      return new RPCError("timeout", method, `no response in ${timeoutMs}ms`)
+    }
+    return result
   }
 
   /** Send a raw frame (used by P2PKit for mesh frames and by the RPC layer). */
@@ -209,6 +244,12 @@ export class Peer<Msg = unknown> {
       case "msg":
         this.onMessage(frame)
         return
+      case "req":
+        void this.onReq(frame)
+        return
+      case "res":
+        this.onRes(frame)
+        return
       case "ping":
         void this.sendFrame({ v: WIRE_VERSION, k: "pong", id: frame.id })
         return
@@ -262,6 +303,29 @@ export class Peer<Msg = unknown> {
     for (const frame of this.outbox.splice(0)) void this.transport!.send(frame)
     this.emitter.emit("connect")
     this.startPings()
+  }
+
+  private async onReq(frame: ReqFrame): Promise<void> {
+    const router = this.options.router
+    const ctx: RPCContext = { from: this._remote }
+    const result: DispatchResult = router
+      ? await router.dispatch(frame.method, frame.body, ctx)
+      : { ok: false, err: { code: "no_handler", method: frame.method } }
+    const res: ResFrame = result.ok
+      ? { v: WIRE_VERSION, k: "res", id: frame.id, ok: true, body: result.body }
+      : { v: WIRE_VERSION, k: "res", id: frame.id, ok: false, err: result.err }
+    await this.sendFrame(res)
+  }
+
+  private onRes(frame: ResFrame): void {
+    const resolve = this.pendingRPC.get(frame.id)
+    if (!resolve) return
+    this.pendingRPC.delete(frame.id)
+    resolve(
+      frame.ok
+        ? { ok: true, body: frame.body }
+        : { ok: false, err: frame.err ?? { code: "unknown", method: "" } },
+    )
   }
 
   private onMessage(frame: MsgFrame): void {

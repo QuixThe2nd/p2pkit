@@ -29,12 +29,22 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: bun run build
-      - run: bun test test/smoke
+      # Run the smoke script directly (it asserts by throwing) rather than via the
+      # bun test runner, so the exact same file also runs under Deno and Node.
+      - run: bun test/smoke/smoke.mjs
 
   deno:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The smoke test imports the built dist/, so build it with Node first — tsup
+      # is a Node tool. Deno then runs the same runtime-agnostic script.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x

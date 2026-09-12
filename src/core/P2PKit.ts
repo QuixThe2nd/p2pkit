@@ -3,10 +3,15 @@ import type { Signer } from "../auth/signer.js"
 import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Transport } from "../transports/types.js"
-import type { Frame, BcastFrame, SubFrame, PubFrame } from "../wire/index.js"
+import type { Frame, BcastFrame, SubFrame, PubFrame, GossipFrame } from "../wire/index.js"
 import { WIRE_VERSION } from "../wire/index.js"
+import type { Discovery, DiscoveryHost } from "../discovery/types.js"
 import { Emitter } from "../utils/emitter.js"
 import { randomId } from "../utils/id.js"
+import type { Router } from "../rpc/router.js"
+import type { API } from "../rpc/api.js"
+import type { APISchema } from "../rpc/schema.js"
+import type { AnyProtocol } from "../rpc/protocol.js"
 import { Peer } from "./Peer.js"
 import { Topic, type TopicOptions, type TopicHost } from "./topic.js"
 import { SeenCache, broadcastSignPayload, pubSignPayload } from "./envelope.js"
@@ -35,6 +40,16 @@ export interface P2PKitOptions {
   signedBroadcasts?: boolean
   broadcast?: BroadcastOptions
   caps?: string[]
+  /** The API this node serves (README §2.1); its schema is reused for validation. */
+  api?: API<APISchema>
+  /** Handlers for incoming RPC calls, from `api.router({...})` (README §2.1). */
+  router?: Router
+  /** Type + validate one-way messages (README §2.3); invalid inbound messages are dropped. */
+  protocol?: AnyProtocol
+  /** Per-call RPC timeout in ms. Default 30000. */
+  rpcTimeout?: number
+  /** Discovery channels to grow/heal the mesh beyond the signalling room (README §4). */
+  discovery?: Discovery | Discovery[]
   /**
    * Advanced: supply a transport for a peer instead of the default WebRTC one.
    * Return `undefined` to fall back to WebRTC. Enables custom link types and
@@ -63,7 +78,7 @@ const REPLAY_WINDOW = 1024
  * whole-mesh {@link P2PKit.broadcast} flooding and subscription-scoped
  * {@link P2PKit.topic} pub/sub.
  */
-export class P2PKit<Msg = unknown> implements TopicHost {
+export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   /** Directly-connected peers, keyed by id. */
   readonly peers = new Map<PeerId, Peer<Msg>>()
 
@@ -73,7 +88,14 @@ export class P2PKit<Msg = unknown> implements TopicHost {
   private readonly emitter = new Emitter<P2PKitEvents<Msg>>()
   private readonly ttl: number
 
-  private self?: PeerId
+  // Discovery channels + their event fan-out (peer connected / inbound gossip).
+  private readonly discoveries: Discovery[]
+  private readonly discoveryEvents = new Emitter<{
+    peerConnected: (peer: PeerId) => void
+    gossip: (from: PeerId, peers: PeerId[]) => void
+  }>()
+
+  private _self?: PeerId
   private started = false
 
   // Broadcast dedup + signed-broadcast replay tracking.
@@ -98,11 +120,18 @@ export class P2PKit<Msg = unknown> implements TopicHost {
     this.bcastNonces = new SeenCache(Math.max(dedupWindow, BROADCAST_FRESHNESS_MS))
     this.subGossipSeen = new SeenCache(dedupWindow)
     this.pubDedup = new SeenCache(dedupWindow)
+    const d = options.discovery
+    this.discoveries = d === undefined ? [] : Array.isArray(d) ? d : [d]
   }
 
   get selfId(): PeerId {
-    if (!this.self) throw new Error("P2PKit not started — call start() first")
-    return this.self
+    if (!this._self) throw new Error("P2PKit not started — call start() first")
+    return this._self
+  }
+
+  /** This node's id (satisfies {@link DiscoveryHost}); alias of {@link selfId}. */
+  get self(): PeerId {
+    return this.selfId
   }
 
   on<E extends keyof P2PKitEvents<Msg>>(event: E, handler: P2PKitEvents<Msg>[E]): void {
@@ -114,18 +143,20 @@ export class P2PKit<Msg = unknown> implements TopicHost {
     if (this.started) return
     this.started = true
     await (this.signer as { ready?: Promise<void> } | undefined)?.ready
-    this.self = this.signer?.id ?? this.options.self
-    if (!this.self) throw new Error("P2PKit requires `self` or a `signer`")
+    this._self = this.signer?.id ?? this.options.self
+    if (!this._self) throw new Error("P2PKit requires `self` or a `signer`")
     if (this.options.signedBroadcasts && !this.signer) {
       throw new Error("`signedBroadcasts` requires a `signer`")
     }
     await this.signalling.ready
     this.signalling.onMessage(message => this.onSignal(message))
-    this.signalling.send({ announce: true, from: this.self })
+    this.signalling.send({ announce: true, from: this._self })
+    for (const discovery of this.discoveries) await discovery.start(this)
   }
 
   /** Stop the node and close every connection. */
   stop(): void {
+    for (const discovery of this.discoveries) discovery.stop()
     for (const peer of this.peers.values()) peer.disconnect()
     this.peers.clear()
   }
@@ -148,25 +179,25 @@ export class P2PKit<Msg = unknown> implements TopicHost {
   // ---- peer lifecycle ---------------------------------------------------
 
   private onSignal(message: SignallingMessage): void {
-    if ("announce" in message && message.from !== this.self) {
+    if ("announce" in message && message.from !== this._self) {
       const isNew = !this.peers.has(message.from)
       this.ensurePeer(message.from)
       // Re-announce so the newcomer learns about us too.
-      if (isNew && this.self) this.signalling.send({ announce: true, from: this.self })
+      if (isNew && this._self) this.signalling.send({ announce: true, from: this._self })
     }
   }
 
   private ensurePeer(remote: PeerId): void {
-    if (!this.self || remote === this.self || this.peers.has(remote)) return
+    if (!this._self || remote === this._self || this.peers.has(remote)) return
     if (this.options.maxPeers !== undefined && this.peers.size >= this.options.maxPeers) return
 
     const injected = this.options.createTransport?.({
-      self: this.self,
+      self: this._self,
       remote,
-      initiator: this.self < remote,
+      initiator: this._self < remote,
     })
     const peer = new Peer<Msg>({
-      self: this.self,
+      self: this._self,
       remote,
       signalling: this.signalling,
       signer: this.signer,
@@ -174,14 +205,57 @@ export class P2PKit<Msg = unknown> implements TopicHost {
       iceServers: this.options.iceServers,
       encrypted: this.options.encrypted,
       caps: this.options.caps,
+      router: this.options.router,
+      rpcTimeout: this.options.rpcTimeout,
       transport: injected,
     })
     this.peers.set(remote, peer)
-    peer.on("message", msg => this.emitter.emit("message", msg, peer))
+    peer.on("message", msg => this.deliverMessage(msg, peer))
     peer.on("frame", frame => this.onMeshFrame(frame, peer))
+    peer.on("connect", () => this.discoveryEvents.emit("peerConnected", peer.remote))
     peer.on("disconnect", () => this.peers.delete(remote))
     peer.on("error", err => this.emitter.emit("error", err))
     this.emitter.emit("peer", peer)
+  }
+
+  // ---- discovery (DiscoveryHost) ---------------------------------------
+
+  /** Connected peer ids (satisfies {@link DiscoveryHost}). */
+  peerIds(): PeerId[] {
+    return [...this.peers.keys()]
+  }
+
+  connect(remote: PeerId): void {
+    this.ensurePeer(remote)
+  }
+
+  sendGossip(to: PeerId, peers: PeerId[]): void {
+    const peer = this.peers.get(to)
+    if (peer?.connected) void peer.sendFrame({ v: WIRE_VERSION, k: "gossip", peers })
+  }
+
+  onPeerConnected(handler: (peer: PeerId) => void): () => void {
+    return this.discoveryEvents.on("peerConnected", handler)
+  }
+
+  onGossip(handler: (from: PeerId, peers: PeerId[]) => void): () => void {
+    return this.discoveryEvents.on("gossip", handler)
+  }
+
+  /**
+   * Emit a `message` to app listeners, dropping it when a `protocol` is set and
+   * the message fails validation — so a malformed or spoofed message never
+   * reaches application code (README §2.3).
+   */
+  private deliverMessage(msg: Msg, peer: Peer<Msg>): void {
+    const protocol = this.options.protocol
+    if (protocol) {
+      const valid = protocol.validate(msg)
+      if (valid === undefined) return
+      this.emitter.emit("message", valid as Msg, peer)
+      return
+    }
+    this.emitter.emit("message", msg, peer)
   }
 
   private sendToAll(frame: Frame, except?: Peer<Msg>): void {
@@ -210,7 +284,7 @@ export class P2PKit<Msg = unknown> implements TopicHost {
     if (this.options.signedBroadcasts || frame.sig !== undefined) {
       if (!(await this.verifyBroadcast(frame))) return
     }
-    this.emitter.emit("message", frame.body as Msg, from)
+    this.deliverMessage(frame.body as Msg, from)
     if (frame.ttl > 1) this.sendToAll({ ...frame, ttl: frame.ttl - 1 }, from)
   }
 
@@ -286,10 +360,17 @@ export class P2PKit<Msg = unknown> implements TopicHost {
       case "pub":
         await this.onPublish(frame, from)
         return
+      case "gossip":
+        this.onGossipFrame(frame, from)
+        return
       default:
-        // gossip (discovery, Phase 7) and req/res (RPC, Phase 6) handled elsewhere.
+        // req/res (RPC) are consumed inside Peer, before the frame event.
         return
     }
+  }
+
+  private onGossipFrame(frame: GossipFrame, from: Peer<Msg>): void {
+    this.discoveryEvents.emit("gossip", from.remote, frame.peers)
   }
 
   private onSubscription(frame: SubFrame, from: Peer<Msg>): void {

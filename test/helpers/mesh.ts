@@ -102,6 +102,9 @@ export interface MeshNodeOptions {
   signer?: Signer
   signedBroadcasts?: boolean
   broadcast?: { ttl?: number; dedupWindow?: number }
+  protocol?: import("../../src/rpc/index.js").AnyProtocol
+  router?: import("../../src/rpc/index.js").Router
+  discovery?: import("../../src/discovery/index.js").Discovery | import("../../src/discovery/index.js").Discovery[]
 }
 
 /**
