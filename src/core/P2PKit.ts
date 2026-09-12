@@ -1,5 +1,5 @@
 import type { PeerId } from "../utils/types.js"
-import type { Signer } from "../auth/signer.js"
+import { NoopSigner, type Signer } from "../auth/signer.js"
 import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Transport } from "../transports/types.js"
@@ -34,7 +34,7 @@ export interface P2PKitOptions {
   iceServers?: RTCIceServer[]
   /** Cap on direct connections; excess reachability is maintained by relaying. */
   maxPeers?: number
-  /** End-to-end encrypt direct messages (requires an `ECDSASigner`). */
+  /** Encrypt all post-handshake frames on each direct connection (requires an `ECDSASigner`). */
   encrypted?: boolean
   /** Sign every broadcast so relays can't spoof the origin (requires a signer). */
   signedBroadcasts?: boolean
@@ -55,15 +55,29 @@ export interface P2PKitOptions {
    * Return `undefined` to fall back to WebRTC. Enables custom link types and
    * deterministic testing.
    */
-  createTransport?: (info: { self: PeerId; remote: PeerId; initiator: boolean }) => Transport<Frame> | undefined
+  createTransport?: (info: {
+    self: PeerId
+    remote: PeerId
+    initiator: boolean
+  }) => Transport<Frame> | undefined
+}
+
+/** Authorship is distinct from the immediate connection that delivered a message. */
+export interface MessageMetadata {
+  /** Claimed original sender; trust for authorization only when originVerified is true. */
+  readonly origin: PeerId
+  /** Immediate peer that delivered the message. */
+  readonly via: PeerId
+  /** Origin verified using the configured signer (handshake for direct messages). */
+  readonly originVerified: boolean
 }
 
 /** Events emitted by {@link P2PKit}. */
 export type P2PKitEvents<Msg> = {
   /** A new peer joined; attach handlers before it connects. */
   peer: (peer: Peer<Msg>) => void
-  /** A direct or broadcast message arrived, with the delivering peer. */
-  message: (msg: Msg, peer: Peer<Msg>) => void
+  /** A direct or broadcast message, delivering peer, and original-sender metadata. */
+  message: (msg: Msg, peer: Peer<Msg>, metadata: MessageMetadata) => void
   error: (err: Error) => void
 }
 
@@ -74,7 +88,7 @@ const REPLAY_WINDOW = 1024
 
 /**
  * Connects you to a mesh of peers and hands you each one as it joins,
- * negotiating the best transport automatically (README §1). Provides
+ * using WebRTC or an injected transport (README §1). Provides
  * whole-mesh {@link P2PKit.broadcast} flooding and subscription-scoped
  * {@link P2PKit.topic} pub/sub.
  */
@@ -108,6 +122,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   private readonly pubDedup: SeenCache
   private readonly topicSubs = new Map<string, Map<PeerId, number>>()
   private readonly pubSeq = new Map<string, number>()
+  private readonly pubReceived = new Map<string, Set<number>>()
   private readonly pubHighest = new Map<string, number>()
 
   constructor(options: P2PKitOptions) {
@@ -145,7 +160,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
     await (this.signer as { ready?: Promise<void> } | undefined)?.ready
     this._self = this.signer?.id ?? this.options.self
     if (!this._self) throw new Error("P2PKit requires `self` or a `signer`")
-    if (this.options.signedBroadcasts && !this.signer) {
+    if (this.options.signedBroadcasts && (!this.signer || this.signer instanceof NoopSigner)) {
       throw new Error("`signedBroadcasts` requires a `signer`")
     }
     await this.signalling.ready
@@ -163,14 +178,20 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
 
   /** Flood a message across the whole mesh (README §1). */
   broadcast(msg: Msg): void {
-    void this.doBroadcast(msg)
+    void this.doBroadcast(msg).catch(err => this.reportError(err))
   }
 
   /** Get (or create) a subscription-scoped topic (README §3). */
   topic<T = Msg>(name: string, opts: TopicOptions = {}): Topic<T> {
     const existing = this.topics.get(name)
-    if (existing) return existing as Topic<T>
-    if (opts.signed && !this.signer) throw new Error("signed topics require a `signer`")
+    if (existing) {
+      if (opts.signed !== undefined && opts.signed !== existing.signed) {
+        throw new Error(`topic ${name} already exists with a different signing policy`)
+      }
+      return existing as Topic<T>
+    }
+    if (opts.signed && (!this.signer || this.signer instanceof NoopSigner))
+      throw new Error("signed topics require a `signer`")
     const topic = new Topic<T>(this, name, opts)
     this.topics.set(name, topic as Topic<unknown>)
     return topic
@@ -211,7 +232,9 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
     })
     this.peers.set(remote, peer)
     peer.on("message", msg => this.deliverMessage(msg, peer))
-    peer.on("frame", frame => this.onMeshFrame(frame, peer))
+    peer.on("frame", frame => {
+      void this.onMeshFrame(frame, peer).catch(err => this.reportError(err))
+    })
     peer.on("connect", () => this.discoveryEvents.emit("peerConnected", peer.remote))
     peer.on("disconnect", () => this.peers.delete(remote))
     peer.on("error", err => this.emitter.emit("error", err))
@@ -231,7 +254,10 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
 
   sendGossip(to: PeerId, peers: PeerId[]): void {
     const peer = this.peers.get(to)
-    if (peer?.connected) void peer.sendFrame({ v: WIRE_VERSION, k: "gossip", peers })
+    if (peer?.connected)
+      void peer
+        .sendFrame({ v: WIRE_VERSION, k: "gossip", peers })
+        .catch(err => this.reportError(err))
   }
 
   onPeerConnected(handler: (peer: PeerId) => void): () => void {
@@ -247,20 +273,33 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
    * the message fails validation — so a malformed or spoofed message never
    * reaches application code (README §2.3).
    */
-  private deliverMessage(msg: Msg, peer: Peer<Msg>): void {
+  private deliverMessage(
+    msg: Msg,
+    peer: Peer<Msg>,
+    metadata: MessageMetadata = {
+      origin: peer.remote,
+      via: peer.remote,
+      originVerified: peer.authenticated,
+    },
+  ): void {
     const protocol = this.options.protocol
     if (protocol) {
       const valid = protocol.validate(msg)
       if (valid === undefined) return
-      this.emitter.emit("message", valid as Msg, peer)
+      this.emitter.emit("message", valid as Msg, peer, metadata)
       return
     }
-    this.emitter.emit("message", msg, peer)
+    this.emitter.emit("message", msg, peer, metadata)
+  }
+
+  private reportError(err: unknown): void {
+    this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)))
   }
 
   private sendToAll(frame: Frame, except?: Peer<Msg>): void {
     for (const peer of this.peers.values()) {
-      if (peer !== except && peer.connected) void peer.sendFrame(frame)
+      if (peer !== except && peer.connected)
+        void peer.sendFrame(frame).catch(err => this.reportError(err))
     }
   }
 
@@ -269,38 +308,58 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   private async doBroadcast(msg: Msg): Promise<void> {
     const id = randomId(12)
     this.bcastSeen.seen(id)
-    let frame: BcastFrame = { v: WIRE_VERSION, k: "bcast", id, ttl: this.ttl, from: this.selfId, body: msg }
+    let frame: BcastFrame = {
+      v: WIRE_VERSION,
+      k: "bcast",
+      id,
+      ttl: this.ttl,
+      from: this.selfId,
+      body: msg,
+    }
     if (this.options.signedBroadcasts && this.signer) {
       const ts = Date.now()
       const nonce = randomId(8)
-      const sig = await this.signer.sign(broadcastSignPayload({ from: this.selfId, id, ts, nonce, body: msg }))
+      const sig = await this.signer.sign(
+        broadcastSignPayload({ from: this.selfId, id, ts, nonce, body: msg }),
+      )
       frame = { ...frame, ts, nonce, sig }
     }
     this.sendToAll(frame)
   }
 
   private async onBroadcast(frame: BcastFrame, from: Peer<Msg>): Promise<void> {
-    if (this.bcastSeen.seen(frame.id)) return
-    if (this.options.signedBroadcasts || frame.sig !== undefined) {
+    if (this.bcastSeen.has(frame.id)) return
+    const signed = frame.sig !== undefined
+    if (this.options.signedBroadcasts || signed) {
       if (!(await this.verifyBroadcast(frame))) return
     }
-    this.deliverMessage(frame.body as Msg, from)
+    // Commit dedup/replay state only after verification, rechecking after await.
+    if (this.bcastSeen.seen(frame.id)) return
+    if (signed && this.bcastNonces.seen(JSON.stringify([frame.from, frame.nonce]))) return
+    this.deliverMessage(frame.body as Msg, from, {
+      origin: frame.from,
+      via: from.remote,
+      originVerified: signed && !!this.signer && !(this.signer instanceof NoopSigner),
+    })
     if (frame.ttl > 1) this.sendToAll({ ...frame, ttl: frame.ttl - 1 }, from)
   }
 
   private async verifyBroadcast(frame: BcastFrame): Promise<boolean> {
     if (frame.sig === undefined || frame.ts === undefined || frame.nonce === undefined) return false
     if (Math.abs(Date.now() - frame.ts) > BROADCAST_FRESHNESS_MS) return false
-    if (this.bcastNonces.seen(`${frame.from}|${frame.nonce}`)) return false
-    if (!this.signer) return true // cannot verify without a signer; accept and relay
-    const payload = broadcastSignPayload({
-      from: frame.from,
-      id: frame.id,
-      ts: frame.ts,
-      nonce: frame.nonce,
-      body: frame.body,
-    })
-    return this.signer.verify(frame.sig, payload, frame.from)
+    if (this.bcastNonces.has(JSON.stringify([frame.from, frame.nonce]))) return false
+    if (!this.signer) return true // Relay without claiming origin verification.
+    return this.signer.verify(
+      frame.sig,
+      broadcastSignPayload({
+        from: frame.from,
+        id: frame.id,
+        ts: frame.ts,
+        nonce: frame.nonce,
+        body: frame.body,
+      }),
+      frame.from,
+    )
   }
 
   // ---- topics (TopicHost) ----------------------------------------------
@@ -312,7 +371,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   }
 
   publishToTopic(topic: string, body: unknown, signed: boolean): void {
-    void this.doPublish(topic, body, signed)
+    void this.doPublish(topic, body, signed).catch(err => this.reportError(err))
   }
 
   subscribersOf(topic: string): Set<PeerId> {
@@ -339,12 +398,13 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
       body,
     }
     if (signed && this.signer) {
-      const sig = await this.signer.sign(pubSignPayload({ topic, from: this.selfId, seq, nonce, body }))
+      const sig = await this.signer.sign(
+        pubSignPayload({ topic, from: this.selfId, seq, nonce, body }),
+      )
       frame = { ...frame, sig }
     }
-    this.pubDedup.seen(`${topic}|${this.selfId}|${seq}`)
-    // Local subscribers receive their own publishes' echoes? No — deliver only to
-    // remote-facing flooding; local emit happens on the publisher's own Topic here.
+    this.pubDedup.seen(JSON.stringify([topic, this.selfId, seq]))
+    // Publishes do not echo to the local publisher.
     this.sendToAll(frame)
   }
 
@@ -383,28 +443,34 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   }
 
   private async onPublish(frame: PubFrame, from: Peer<Msg>): Promise<void> {
-    const dedupKey = `${frame.topic}|${frame.from}|${frame.seq}`
-    if (this.pubDedup.seen(dedupKey)) return
-
-    // Sliding-window replay protection: drop stale sequence numbers.
-    const highestKey = `${frame.topic}|${frame.from}`
-    const highest = this.pubHighest.get(highestKey) ?? 0
-    if (frame.seq <= highest - REPLAY_WINDOW) return
-    if (frame.seq > highest) this.pubHighest.set(highestKey, frame.seq)
-
-    if (frame.sig !== undefined && this.signer) {
-      const payload = pubSignPayload({
-        topic: frame.topic,
-        from: frame.from,
-        seq: frame.seq,
-        nonce: frame.nonce,
-        body: frame.body,
-      })
-      if (!(await this.signer.verify(frame.sig, payload, frame.from))) return
-    }
-
     const topic = this.topics.get(frame.topic)
-    if (topic) topic.deliver(frame.body, frame.from)
+    if (topic?.signed && !frame.sig) return
+    let originVerified = false
+    if (frame.sig !== undefined && this.signer) {
+      if (!(await this.signer.verify(frame.sig, pubSignPayload(frame), frame.from))) return
+      originVerified = !(this.signer instanceof NoopSigner)
+    }
+    if (topic?.signed && !originVerified) return
+
+    // No replay state is touched until policy and authenticity checks pass.
+    const dedupKey = JSON.stringify([frame.topic, frame.from, frame.seq])
+    const highestKey = JSON.stringify([frame.topic, frame.from])
+    const highest = this.pubHighest.get(highestKey) ?? 0
+    const received = this.pubReceived.get(highestKey) ?? new Set<number>()
+    if (frame.seq <= highest - REPLAY_WINDOW || received.has(frame.seq)) return
+    if (this.pubDedup.seen(dedupKey)) return
+    const nextHighest = Math.max(highest, frame.seq)
+    this.pubHighest.set(highestKey, nextHighest)
+    received.add(frame.seq)
+    for (const seq of received) if (seq <= nextHighest - REPLAY_WINDOW) received.delete(seq)
+    this.pubReceived.set(highestKey, received)
+
+    if (topic)
+      topic.deliver(frame.body, frame.from, {
+        origin: frame.from,
+        via: from.remote,
+        originVerified,
+      })
     if (frame.ttl > 1) this.sendToAll({ ...frame, ttl: frame.ttl - 1 }, from)
   }
 }

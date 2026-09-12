@@ -54,6 +54,6 @@ export async function getRTC(override?: RTCBackendSource): Promise<RTCBackend> {
   if (werift) return werift
 
   throw new Error(
-    "No WebRTC backend found. Install @roamhq/wrtc (Node) or werift (Deno), or pass one via getRTC()/transports.rtc.",
+    "No WebRTC backend found. Install @roamhq/wrtc (Node) or werift (Deno), or pass one via getRTC() or the backend option.",
   )
 }

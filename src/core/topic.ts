@@ -1,8 +1,9 @@
+import type { MessageMetadata } from "./P2PKit.js"
 import type { PeerId } from "../utils/types.js"
 import { Emitter } from "../utils/emitter.js"
 
 export interface TopicOptions {
-  /** Sign each publish and verify the publisher's identity (requires a signer). */
+  /** Require verified signatures on incoming publishes and sign outgoing publishes. */
   signed?: boolean
 }
 
@@ -16,28 +17,33 @@ export interface TopicHost {
 }
 
 /**
- * A subscription-scoped channel within the mesh (README §3). Publishing reaches
- * only subscribers; subscriptions are gossiped so a publish is relayed toward
- * subscribers you aren't directly connected to. Replay protection is always on
- * (per-sender sequence + nonce); pass `{ signed: true }` to also verify the
- * publisher.
+ * A subscription-scoped channel within the mesh. Publishes flood the network;
+ * only local subscribers receive events. Pass `{ signed: true }` to require
+ * verified origin signatures before delivery or relay at this node.
  */
 export class Topic<T = unknown> {
   readonly name: string
   private readonly host: TopicHost
   private readonly opts: TopicOptions
-  private readonly emitter = new Emitter<{ message: (msg: T, from: PeerId) => void }>()
+  private readonly emitter = new Emitter<{
+    message: (msg: T, from: PeerId, metadata: MessageMetadata) => void
+  }>()
   private left = false
 
   constructor(host: TopicHost, name: string, opts: TopicOptions = {}) {
     this.host = host
     this.name = name
-    this.opts = opts
+    this.opts = { ...opts }
     host.floodSubscription("sub", name)
   }
 
-  on(event: "message", handler: (msg: T, from: PeerId) => void): void {
+  on(event: "message", handler: (msg: T, from: PeerId, metadata: MessageMetadata) => void): void {
     this.emitter.on(event, handler)
+  }
+
+  /** Whether this subscription requires verified origin signatures. */
+  get signed(): boolean {
+    return this.opts.signed ?? false
   }
 
   /** Subscribers we know about (learned via gossip). */
@@ -60,7 +66,7 @@ export class Topic<T = unknown> {
   }
 
   /** Internal: deliver an incoming publish to local listeners. */
-  deliver(msg: T, from: PeerId): void {
-    if (!this.left) this.emitter.emit("message", msg, from)
+  deliver(msg: T, from: PeerId, metadata: MessageMetadata): void {
+    if (!this.left) this.emitter.emit("message", msg, from, metadata)
   }
 }
