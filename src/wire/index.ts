@@ -6,7 +6,7 @@ import type { PeerId } from "../utils/types.js"
  * backward-incompatible way (see README — the envelope is "hard to change
  * later", so it is versioned rather than guessed at).
  */
-export const WIRE_VERSION = 1 as const
+export const WIRE_VERSION = 2 as const
 
 /** Handshake: announce identity + capabilities, carry a nonce to be signed. */
 export interface HelloFrame {
@@ -37,8 +37,6 @@ export interface MsgFrame {
   v: typeof WIRE_VERSION
   k: "msg"
   body: unknown
-  /** Set when `body` is an encrypted (base64) AEAD payload rather than plaintext. */
-  enc?: boolean
 }
 
 /** RPC request. */
@@ -76,7 +74,7 @@ export interface BcastFrame {
   sig?: string
 }
 
-/** Topic subscribe / unsubscribe (gossiped so publishes route only toward subscribers). */
+/** Topic subscribe / unsubscribe (gossiped to advertise subscriber membership). */
 export interface SubFrame {
   v: typeof WIRE_VERSION
   k: "sub" | "unsub"
@@ -97,7 +95,7 @@ export interface PubFrame {
   seq: number
   /** Per-message nonce within the replay window. */
   nonce: string
-  /** Hop limit for relaying toward subscribers. */
+  /** Hop limit for flooding. */
   ttl: number
   body: unknown
   /** Origin signature, present on `{ signed: true }` topics. */
@@ -135,8 +133,16 @@ export interface PongFrame {
   id: string
 }
 
+/** Authenticated encryption of one complete post-handshake frame. */
+export interface SealedFrame {
+  v: typeof WIRE_VERSION
+  k: "sealed"
+  body: string
+}
+
 /** The full set of frames P2PKit exchanges. */
 export type Frame =
+  | SealedFrame
   | HelloFrame
   | AckFrame
   | MsgFrame
@@ -162,6 +168,7 @@ export class WireError extends Error {
 }
 
 const KINDS: ReadonlySet<string> = new Set<FrameKind>([
+  "sealed",
   "hello",
   "ack",
   "msg",
@@ -196,10 +203,89 @@ export const FrameCodec = {
     }
     if (typeof obj !== "object" || obj === null) throw new WireError("frame is not an object")
     const rec = obj as Record<string, unknown>
-    if (rec["v"] !== WIRE_VERSION) throw new WireError(`unsupported wire version: ${String(rec["v"])}`)
+    if (rec["v"] !== WIRE_VERSION)
+      throw new WireError(`unsupported wire version: ${String(rec["v"])}`)
     if (typeof rec["k"] !== "string" || !KINDS.has(rec["k"])) {
       throw new WireError(`unknown frame kind: ${String(rec["k"])}`)
     }
+    validateFrame(obj)
     return obj as Frame
   },
+}
+
+/** Validate even frames from injected transports, which may bypass the codec. */
+export function validateFrame(value: unknown): asserts value is Frame {
+  if (!value || typeof value !== "object") throw new WireError("frame is not an object")
+  const f = value as Record<string, unknown>
+  if (f.v !== WIRE_VERSION) throw new WireError("unsupported wire version")
+  const str = (key: string) => typeof f[key] === "string" && (f[key] as string).length > 0
+  const int = (key: string, min = 0) => Number.isSafeInteger(f[key]) && (f[key] as number) >= min
+  const sig = f.sig === undefined || typeof f.sig === "string"
+  let valid = false
+  switch (f.k) {
+    case "hello":
+      valid =
+        str("from") &&
+        str("nonce") &&
+        Array.isArray(f.caps) &&
+        f.caps.every(x => typeof x === "string") &&
+        sig
+      break
+    case "ack":
+      valid = str("from") && str("nonce") && sig
+      break
+    case "sealed":
+      valid = str("body")
+      break
+    case "msg":
+      valid = f.enc === undefined
+      break
+    case "req":
+      valid = str("id") && str("method")
+      break
+    case "res": {
+      const err = f.err as Record<string, unknown> | undefined
+      valid =
+        str("id") &&
+        typeof f.ok === "boolean" &&
+        (f.ok ||
+          (!!err &&
+            typeof err.code === "string" &&
+            typeof err.method === "string" &&
+            (err.message === undefined || typeof err.message === "string")))
+      break
+    }
+    case "bcast":
+      valid =
+        str("id") &&
+        str("from") &&
+        int("ttl", 1) &&
+        sig &&
+        (f.ts === undefined || int("ts")) &&
+        (f.nonce === undefined || str("nonce"))
+      break
+    case "pub":
+      valid = str("topic") && str("from") && str("nonce") && int("seq", 1) && int("ttl", 1) && sig
+      break
+    case "sub":
+    case "unsub":
+      valid = str("topic") && str("from") && str("id")
+      break
+    case "gossip":
+      valid = Array.isArray(f.peers) && f.peers.every(x => typeof x === "string" && x.length > 0)
+      break
+    case "chunk":
+      valid =
+        str("id") &&
+        int("i") &&
+        int("n", 1) &&
+        (f.i as number) < (f.n as number) &&
+        typeof f.part === "string"
+      break
+    case "ping":
+    case "pong":
+      valid = str("id")
+      break
+  }
+  if (!valid) throw new WireError("invalid frame shape")
 }

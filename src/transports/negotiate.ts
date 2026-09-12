@@ -12,8 +12,8 @@ export const DEFAULT_TRANSPORT_ORDER: readonly TransportName[] = ["rtc", "utp", 
 
 /**
  * Choose the transport two peers should use: the most-preferred capability both
- * advertise (README §6 — "negotiates the best transport with each peer
- * automatically"). Returns `undefined` when there is no overlap.
+ * advertise. This helper is not automatically called by Peer/P2PKit.
+ * Returns `undefined` when there is no overlap.
  *
  * This is the *selection* half of negotiation. Actually dialing a non-RTC
  * transport also needs the peer's endpoint (an HTTP url, µTP port, or DHT id);
