@@ -11,6 +11,10 @@ jobs:
     strategy:
       matrix:
         node: [18, 20, 22]
+    # Node 18 predates unflagged globalThis.crypto; the tests exercise the
+    # webcrypto-based signers, so enable the flag there (no-op semantics on 20+).
+    env:
+      NODE_OPTIONS: ${{ matrix.node == 18 && '--experimental-global-webcrypto' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
