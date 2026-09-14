@@ -13,6 +13,10 @@ export default defineConfig({
     backends: "src/backends/index.ts",
     framing: "src/framing/index.ts",
     utils: "src/utils/index.ts",
+    // Browser-safe ESM mirror of the IIFE entry (src/iife.ts): only modules a
+    // <script> embed needs, no Node-only imports. Consumed by bundlers that
+    // import the package instead of using dist/p2pkit.iife.js.
+    iife: "src/iife.ts",
   },
   format: ["esm"],
   target: "es2022",

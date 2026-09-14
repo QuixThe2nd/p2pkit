@@ -49,6 +49,10 @@
     "./utils": {
       "types": "./dist/utils.d.ts",
       "import": "./dist/utils.js"
+    },
+    "./iife": {
+      "types": "./dist/iife.d.ts",
+      "import": "./dist/iife.js"
     }
   },
   "scripts": {
@@ -59,6 +63,7 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "format": "prettier --write .",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
