@@ -9,7 +9,19 @@
 // stay provably compatible with stock p2pkit consumers.
 
 export { isInitiator, chooseTransport, capsFor, DEFAULT_TRANSPORT_ORDER } from "./transports/negotiate.js"
-export { RTCTransport } from "./transports/rtc.js"
+export {
+  RTCTransport,
+  RTCTransportConnectTimeoutError,
+  type RTCTransportOptions,
+  type RTCTransportEvents,
+  type RTCChannelSpec,
+} from "./transports/rtc.js"
+export {
+  RTCDataChannelSendQueue,
+  RTC_SEND_QUEUE_FLUSH_THRESHOLD,
+  type RTCDataChannelLike,
+  type RTCDataChannelSendQueueOptions,
+} from "./transports/rtc-send-queue.js"
 export { DEFAULT_ICE_SERVERS } from "./utils/ice.js"
 export { extractIP } from "./utils/sdp.js"
 export { Emitter } from "./utils/emitter.js"

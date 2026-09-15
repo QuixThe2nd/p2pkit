@@ -123,17 +123,131 @@ var P2PKIT_IIFE = (function (exports) {
     { urls: "stun:global.stun.twilio.com:3478" }
   ];
 
+  // src/transports/rtc-send-queue.ts
+  var RTC_SEND_QUEUE_FLUSH_THRESHOLD = 1 << 20;
+  function payloadByteLength(data) {
+    if (typeof data === "string") return data.length;
+    if (data instanceof ArrayBuffer) return data.byteLength;
+    return data.byteLength;
+  }
+  var RTCDataChannelSendQueue = class {
+    channel;
+    highWaterBytes;
+    lowWaterBytes;
+    onDrain;
+    queue = [];
+    lowHandler;
+    flushing = false;
+    backpressured = false;
+    constructor(options = {}) {
+      this.highWaterBytes = options.highWaterBytes;
+      if (options.highWaterBytes !== void 0) {
+        this.lowWaterBytes = options.lowWaterBytes ?? Math.floor(options.highWaterBytes / 2);
+      } else {
+        this.lowWaterBytes = options.lowWaterBytes;
+      }
+      this.onDrain = options.onDrain;
+    }
+    /** Bind (or re-bind) this queue to a live data channel. */
+    attach(channel) {
+      this.detach();
+      this.channel = channel;
+      if (this.highWaterBytes === void 0) return;
+      channel.bufferedAmountLowThreshold = this.lowWaterBytes;
+      this.lowHandler = () => this.flushQueue();
+      if (channel.addEventListener) channel.addEventListener("bufferedamountlow", this.lowHandler);
+      else channel.onbufferedamountlow = this.lowHandler;
+    }
+    /** Detach from the current channel and clear any pending sends. */
+    detach() {
+      const channel = this.channel;
+      if (channel && this.lowHandler) {
+        if (channel.removeEventListener) channel.removeEventListener("bufferedamountlow", this.lowHandler);
+        else channel.onbufferedamountlow = null;
+      }
+      this.channel = void 0;
+      this.lowHandler = void 0;
+      this.queue.length = 0;
+      this.flushing = false;
+      this.backpressured = false;
+    }
+    /** Channel `bufferedAmount` plus bytes still waiting in this queue. */
+    get bufferedAmount() {
+      let pending = 0;
+      for (const item of this.queue) pending += payloadByteLength(item);
+      return (this.channel?.bufferedAmount ?? 0) + pending;
+    }
+    /**
+     * Send one payload. With {@link highWaterBytes} configured, payloads are queued
+     * (never dropped) while the channel is at or above the high-water mark;
+     * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
+     */
+    async send(data) {
+      const channel = this.channel;
+      if (!channel || channel.readyState !== "open") throw new Error("RTC data channel is not open");
+      if (this.highWaterBytes === void 0) {
+        channel.send(data);
+        await this.pollFlush(channel);
+        return;
+      }
+      if (channel.bufferedAmount >= this.highWaterBytes) {
+        this.backpressured = true;
+        this.queue.push(data);
+        return;
+      }
+      channel.send(data);
+      if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
+      else this.tryFlushAfterSend();
+    }
+    async pollFlush(channel) {
+      while (channel.readyState === "open" && channel.bufferedAmount > RTC_SEND_QUEUE_FLUSH_THRESHOLD) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    tryFlushAfterSend() {
+      if (!this.channel || this.highWaterBytes === void 0) return;
+      if (this.channel.bufferedAmount < this.highWaterBytes) this.flushQueue();
+    }
+    flushQueue() {
+      if (this.flushing || !this.channel || this.highWaterBytes === void 0) return;
+      this.flushing = true;
+      try {
+        const channel = this.channel;
+        while (this.queue.length > 0 && channel.readyState === "open" && channel.bufferedAmount < this.highWaterBytes) {
+          channel.send(this.queue.shift());
+        }
+        if (this.queue.length === 0 && this.backpressured) {
+          this.backpressured = false;
+          this.onDrain?.();
+        }
+      } finally {
+        this.flushing = false;
+      }
+    }
+  };
+
   // src/transports/rtc.ts
-  var FLUSH_THRESHOLD = 1 << 20;
+  var RTCTransportConnectTimeoutError = class extends Error {
+    name = "ErrorTimeout";
+    code = "ERR_RTC_CONNECT_TIMEOUT";
+    constructor(timeoutMs) {
+      super(`RTC transport connect timed out after ${timeoutMs}ms`);
+    }
+  };
   var RTCTransport = class {
     remote;
     name = "rtc";
     self;
     signalling;
     emitter = new Emitter();
-    chunker;
+    channelStates = [];
+    channelSpecs;
+    expectedChannelCount;
+    connectTimeoutMs;
+    connectTimer;
+    connectEmitted = false;
+    openChannels = /* @__PURE__ */ new Set();
     pc;
-    channel;
     remoteDescriptionSet = false;
     pendingCandidates = [];
     closed = false;
@@ -142,9 +256,14 @@ var P2PKIT_IIFE = (function (exports) {
       this.self = options.self;
       this.remote = options.remote;
       this.signalling = options.signalling;
-      this.chunker = new Chunker({ maxPacketSize: options.chunkSize });
+      this.channelSpecs = options.channels;
+      this.expectedChannelCount = options.channels?.length ?? 1;
+      this.connectTimeoutMs = options.connectTimeoutMs;
       const iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
       this.pc = new options.backend.RTCPeerConnection({ iceServers });
+      if (this.connectTimeoutMs !== void 0) {
+        this.connectTimer = setTimeout(() => this.handleConnectTimeout(), this.connectTimeoutMs);
+      }
       this.pc.onicecandidate = (ev) => {
         if (ev.candidate) {
           this.signalling.send({
@@ -159,32 +278,129 @@ var P2PKIT_IIFE = (function (exports) {
         if (state === "failed" || state === "closed" || state === "disconnected") this.handleClose();
       };
       if (options.initiator) {
-        this.setupChannel(this.pc.createDataChannel(options.label ?? "p2pkit"));
+        if (options.channels) {
+          for (let i = 0; i < options.channels.length; i++) {
+            const spec = options.channels[i];
+            this.setupChannel(
+              i,
+              this.pc.createDataChannel(spec.label, {
+                ordered: spec.ordered,
+                maxRetransmits: spec.maxRetransmits
+              }),
+              options
+            );
+          }
+        } else {
+          this.setupChannel(
+            0,
+            this.pc.createDataChannel(options.label ?? "p2pkit"),
+            options
+          );
+        }
         void this.negotiate();
       } else {
-        this.pc.ondatachannel = (ev) => this.setupChannel(ev.channel);
+        this.pc.ondatachannel = (ev) => {
+          const label = ev.channel.label;
+          if (options.channels) {
+            const index = options.channels.findIndex((spec) => spec.label === label);
+            if (index === -1) return;
+            this.setupChannel(index, ev.channel, options);
+          } else {
+            this.setupChannel(0, ev.channel, options);
+          }
+        };
       }
       this.signalling.onMessage(this.onSignal);
     }
     get bufferedAmount() {
-      return this.channel?.bufferedAmount ?? 0;
+      let total = 0;
+      for (const state of this.channelStates) total += state.queue.bufferedAmount;
+      return total;
+    }
+    /** Bytes queued on one channel (spec index, or `0` in single-channel mode). */
+    bufferedAmountOn(channelIndex) {
+      return this.channelStates[channelIndex]?.queue.bufferedAmount ?? 0;
     }
     on(event, handler) {
       this.emitter.on(event, handler);
     }
     async send(value) {
-      const channel = this.channel;
-      if (!channel || channel.readyState !== "open") throw new Error("RTC transport is not open");
+      return this.sendOn(0, value);
+    }
+    async sendOn(channelIndex, value) {
+      const state = this.channelStates[channelIndex];
+      if (!state || state.channel.readyState !== "open") {
+        throw new Error("RTC transport is not open");
+      }
       const groupId = randomId(8);
       const data = JSON.stringify(value);
-      for (const packet of this.chunker.split(groupId, data)) channel.send(packet);
-      await this.flush(channel);
+      for (const packet of state.chunker.split(groupId, data)) {
+        await state.queue.send(packet);
+      }
     }
     disconnect() {
       this.closed = true;
+      this.clearConnectTimer();
+      for (const state of this.channelStates) {
+        state.queue.detach();
+        try {
+          state.channel.close();
+        } catch {
+        }
+      }
       try {
-        this.channel?.close();
+        this.pc.close();
       } catch {
+      }
+      this.handleClose();
+    }
+    setupChannel(index, channel, options) {
+      const chunker = new Chunker({ maxPacketSize: options.chunkSize });
+      const queue = new RTCDataChannelSendQueue({
+        highWaterBytes: options.highWaterBytes,
+        lowWaterBytes: options.lowWaterBytes,
+        onDrain: () => this.emitter.emit("drain", index)
+      });
+      queue.attach(channel);
+      this.channelStates[index] = { channel, queue, chunker };
+      try {
+        channel.binaryType = "arraybuffer";
+      } catch {
+      }
+      channel.onopen = () => this.onChannelOpen(index);
+      channel.onmessage = (ev) => this.onData(index, ev.data);
+      channel.onclose = () => this.handleClose();
+      channel.onerror = () => this.emitter.emit("error", new Error("RTC data channel error"));
+      if (channel.readyState === "open") this.onChannelOpen(index);
+    }
+    onChannelOpen(index) {
+      if (this.closed || this.connectEmitted) return;
+      this.openChannels.add(index);
+      if (this.openChannels.size >= this.expectedChannelCount) this.emitConnect();
+    }
+    emitConnect() {
+      if (this.connectEmitted || this.closed) return;
+      this.connectEmitted = true;
+      this.clearConnectTimer();
+      this.emitter.emit("connect");
+    }
+    clearConnectTimer() {
+      if (this.connectTimer !== void 0) {
+        clearTimeout(this.connectTimer);
+        this.connectTimer = void 0;
+      }
+    }
+    handleConnectTimeout() {
+      if (this.closed || this.connectEmitted || this.emittedClose) return;
+      this.closed = true;
+      this.clearConnectTimer();
+      this.emitter.emit("error", new RTCTransportConnectTimeoutError(this.connectTimeoutMs));
+      for (const state of this.channelStates) {
+        state.queue.detach();
+        try {
+          state.channel.close();
+        } catch {
+        }
       }
       try {
         this.pc.close();
@@ -236,19 +452,9 @@ var P2PKIT_IIFE = (function (exports) {
         }
       }
     }
-    setupChannel(channel) {
-      this.channel = channel;
-      try {
-        channel.binaryType = "arraybuffer";
-      } catch {
-      }
-      channel.onopen = () => this.emitter.emit("connect");
-      channel.onmessage = (ev) => this.onData(ev.data);
-      channel.onclose = () => this.handleClose();
-      channel.onerror = () => this.emitter.emit("error", new Error("RTC data channel error"));
-      if (channel.readyState === "open") this.emitter.emit("connect");
-    }
-    onData(data) {
+    onData(channelIndex, data) {
+      const state = this.channelStates[channelIndex];
+      if (!state) return;
       const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
       let packet;
       try {
@@ -256,22 +462,21 @@ var P2PKIT_IIFE = (function (exports) {
       } catch {
         return;
       }
-      const full = this.chunker.ingest(packet);
+      const full = state.chunker.ingest(packet);
       if (full === void 0) return;
       try {
-        this.emitter.emit("message", JSON.parse(full));
+        this.emitter.emit("message", JSON.parse(full), channelIndex);
       } catch {
-      }
-    }
-    async flush(channel) {
-      while (channel.readyState === "open" && channel.bufferedAmount > FLUSH_THRESHOLD) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
     handleClose() {
       if (this.emittedClose) return;
       this.emittedClose = true;
-      this.chunker.reset();
+      this.clearConnectTimer();
+      for (const state of this.channelStates) {
+        state.chunker.reset();
+        state.queue.detach();
+      }
       this.emitter.emit("disconnect");
     }
   };
@@ -290,7 +495,10 @@ var P2PKIT_IIFE = (function (exports) {
   exports.DEFAULT_ICE_SERVERS = DEFAULT_ICE_SERVERS;
   exports.DEFAULT_TRANSPORT_ORDER = DEFAULT_TRANSPORT_ORDER;
   exports.Emitter = Emitter;
+  exports.RTCDataChannelSendQueue = RTCDataChannelSendQueue;
   exports.RTCTransport = RTCTransport;
+  exports.RTCTransportConnectTimeoutError = RTCTransportConnectTimeoutError;
+  exports.RTC_SEND_QUEUE_FLUSH_THRESHOLD = RTC_SEND_QUEUE_FLUSH_THRESHOLD;
   exports.capsFor = capsFor;
   exports.chooseTransport = chooseTransport;
   exports.extractIP = extractIP;
