@@ -7,6 +7,7 @@
   "sideEffects": false,
   "files": [
     "dist",
+    "emscripten",
     "README.md"
   ],
   "exports": {
@@ -53,7 +54,12 @@
     "./iife": {
       "types": "./dist/iife.d.ts",
       "import": "./dist/iife.js"
-    }
+    },
+    "./emscripten/glue": {
+      "import": "./emscripten/js/p2pkit_webrtc_glue.cjs",
+      "require": "./emscripten/js/p2pkit_webrtc_glue.cjs"
+    },
+    "./emscripten/include/*": "./emscripten/include/*"
   },
   "scripts": {
     "build": "tsup",
@@ -63,7 +69,7 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "prepare": "npm run build",
+    "prepare": "npm run build && npm run build:iife",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
