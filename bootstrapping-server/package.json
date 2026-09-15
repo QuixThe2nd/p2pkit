@@ -4,10 +4,20 @@
   "private": true,
   "description": "Minimal WebSocket bootstrapping server for P2PKit peer-to-peer sessions.",
   "type": "module",
-  "main": "server.js",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    }
+  },
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "build": "node build.mjs",
+    "typecheck": "node build.mjs --typecheck",
+    "start": "node dist/server.js",
+    "test": "node --test test/*.test.js",
+    "test:proof": "node test/mm-lobby-proof.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -17,6 +27,8 @@
   },
   "license": "UNLICENSED",
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.7.2"
   }
 }

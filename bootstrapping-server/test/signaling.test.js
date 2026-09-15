@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import WebSocket from 'ws';
-import { createSignalingServer } from '../server.js';
+import { createSignalingServer } from '../dist/server.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -394,8 +394,8 @@ test('cross-origin upgrade is refused; localhost and same-host origins pass', as
   }
 });
 
-test('server.js runs directly: binds PORT, pairs two clients, and shuts down on SIGTERM', async () => {
-  const child = spawn(process.execPath, [path.join(HERE, '..', 'server.js')], {
+test('dist/server.js runs directly: binds PORT, pairs two clients, and shuts down on SIGTERM', async () => {
+  const child = spawn(process.execPath, [path.join(HERE, '..', 'dist', 'server.js')], {
     env: { ...process.env, PORT: '0', HOST: '127.0.0.1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

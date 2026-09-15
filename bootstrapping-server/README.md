@@ -16,9 +16,16 @@ It deliberately does **not** provide:
 
 ## Running
 
+The server is written in TypeScript (`src/`); `npm run build` compiles it to
+`dist/server.js` (esbuild bundle) plus `dist/*.d.ts` declarations. The lobby
+wire types live in the p2pkit client library (`../src/signalling/lobby.ts`,
+exported as `p2pkit/signalling`) and are synced in at build time, so the wire
+format has a single definition shared by server and browser clients.
+
 ```bash
-npm install        # once; installs the single dependency `ws`
-npm start          # runs `node server.js`
+npm install        # once; installs the runtime dependency `ws` + toolchain
+npm run build      # compiles TypeScript to dist/ (required before start/test)
+npm start          # runs `node dist/server.js`
 ```
 
 Defaults: `ws://127.0.0.1:8788/` (WebSocket endpoint, path is not restricted).
@@ -33,7 +40,7 @@ Defaults: `ws://127.0.0.1:8788/` (WebSocket endpoint, path is not restricted).
 ### Using as a module
 
 ```js
-import { createSignalingServer } from './server.js';
+import { createSignalingServer } from './dist/server.js'; // after npm run build
 
 const ctx = createSignalingServer({
   // rateLimit: { max: 120, windowMs: 5000, strikeLimit: 3 },
@@ -116,6 +123,8 @@ how the test suite exercises them quickly.
 ## Tests
 
 ```bash
+npm run build                     # tests run against the built dist/server.js
 npm test                          # node --test test/*.test.js
 node test/mm-lobby-proof.mjs      # protocol proof on port 8799; prints PASS
+npm run typecheck                 # tsc --noEmit over src/
 ```

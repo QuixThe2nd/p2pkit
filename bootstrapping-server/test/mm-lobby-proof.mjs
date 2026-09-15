@@ -11,7 +11,7 @@
  *
  * Prints PASS and exits 0 when every step holds; any deviation exits 1.
  */
-import { createSignalingServer } from '../server.js';
+import { createSignalingServer } from '../dist/server.js';
 import WebSocket from 'ws';
 
 const PORT = 8799;
