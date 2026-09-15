@@ -1,8 +1,8 @@
 {
-  "name": "dunecity-webrtc-signaling",
+  "name": "p2pkit-bootstrapping-server",
   "version": "1.0.0",
   "private": true,
-  "description": "Minimal WebSocket signaling server for DuneCity WebRTC peer-to-peer sessions.",
+  "description": "Minimal WebSocket bootstrapping server for P2PKit peer-to-peer sessions.",
   "type": "module",
   "main": "server.js",
   "scripts": {
