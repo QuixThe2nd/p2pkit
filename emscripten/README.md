@@ -12,7 +12,9 @@ vendored, and no precompiled wasm binary ships here.
 > GPL-2.0-or-later per their notices), extracted from Dune Legacy's browser
 > multiplayer transport. See `LICENSE` (GPL-2.0 text). The core bundle never
 > imports this glue, and this glue reaches the core only at runtime through
-> the `P2PKIT_IIFE` global — the two licenses do not mix inside one artifact.
+> the `P2PKIT_IIFE` global. The shipped npm package contains both source sets,
+> so its `license` metadata is `SEE LICENSE IN README.md`; each file remains
+> under the license stated in its own header/notice — nothing is relicensed.
 
 ## What ships here
 
@@ -148,3 +150,4 @@ With the `p2pkit` package installed:
 - `p2pkit/emscripten/glue` → the bridge (CJS, `--js-library`-ready)
 - `p2pkit/emscripten/include/<path>` → the C++ headers
 - `p2pkit/emscripten/LICENSE` → GPL-2.0 text
+- `p2pkit/emscripten/README.md` → this document

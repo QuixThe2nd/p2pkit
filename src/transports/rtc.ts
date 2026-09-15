@@ -18,9 +18,10 @@ export interface RTCChannelSpec {
    * - `"queue"`: sends accepted while under the high-water mark queue in order
    *   and flush on `bufferedamountlow` (never dropped).
    * - `"drop"`: sends at or above the high-water mark are rejected
-   *   synchronously (`sendOn` resolves `false`, {@link RTCTransport.trySendOn}
-   *   returns `false`) so lossy, time-sensitive producers can resend fresh
-   *   state instead of buffering stale state.
+   *   synchronously: {@link RTCTransport.trySendOn} returns `false` and the
+   *   async {@link RTCTransport.sendOn} rejects with
+   *   {@link RTCTransportBackpressureDropError}, so lossy, time-sensitive
+   *   producers can resend fresh state instead of buffering stale state.
    */
   mode?: "queue" | "drop"
   /**
@@ -95,6 +96,22 @@ export class RTCTransportConnectTimeoutError extends Error {
 
   constructor(timeoutMs: number) {
     super(`RTC transport connect timed out after ${timeoutMs}ms`)
+  }
+}
+
+/**
+ * Distinct error the async {@link RTCTransport.sendOn} rejects with in raw
+ * mode when a `"drop"`-policy channel rejects the payload under backpressure
+ * (the synchronous counterpart to {@link RTCTransport.trySendOn} returning
+ * `false`). It never rejects for this reason on `"queue"`-policy channels or
+ * in the default JSON mode.
+ */
+export class RTCTransportBackpressureDropError extends Error {
+  override readonly name = "ErrorBackpressureDrop"
+  readonly code = "ERR_RTC_BACKPRESSURE_DROP"
+
+  constructor(channelIndex: number) {
+    super(`RTC channel ${channelIndex} dropped raw payload under backpressure (drop mode)`)
   }
 }
 
@@ -239,28 +256,33 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   }
 
   /**
-   * Send one value on the given channel. In raw mode (`raw: true`) binary
-   * payloads cross byte-for-byte and the promise resolves `false` when a
-   * `"drop"`-policy channel rejected the payload under backpressure (it never
-   * rejects for that reason). In the default JSON mode always resolves `true`.
+   * Send one value on the given channel; resolves `undefined` once the payload
+   * has been handed to the send queue (default JSON mode, preserving the
+   * historical `Promise<void>` contract). In raw mode (`raw: true`) binary
+   * payloads cross byte-for-byte: on `"drop"`-policy channels the promise
+   * rejects with {@link RTCTransportBackpressureDropError} when the payload is
+   * rejected under backpressure (use {@link trySendOn} for synchronous
+   * acceptance); on `"queue"`-policy channels it never rejects for that reason.
    */
-  async sendOn(channelIndex: number, value: T): Promise<boolean> {
+  async sendOn(channelIndex: number, value: T): Promise<void> {
     const state = this.channelStates[channelIndex]
     if (!state || state.channel.readyState !== "open") {
       throw new Error("RTC transport is not open")
     }
     if (this.raw) {
       const bytes = toUint8Array(value)
-      if (state.spec?.mode === "drop") return state.queue.trySend(bytes)
+      if (state.spec?.mode === "drop") {
+        if (!state.queue.trySend(bytes)) throw new RTCTransportBackpressureDropError(channelIndex)
+        return
+      }
       await state.queue.send(bytes)
-      return true
+      return
     }
     const groupId = randomId(8)
     const data = JSON.stringify(value)
     for (const packet of state.chunker.split(groupId, data)) {
       await state.queue.send(packet)
     }
-    return true
   }
 
   /**
@@ -279,7 +301,12 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (!state || state.channel.readyState !== "open") return false
     const bytes = toUint8Array(value)
     if (state.spec?.mode === "drop") return state.queue.trySend(bytes)
-    void state.queue.send(bytes)
+    // Accepted for queued delivery; a later native send failure surfaces on
+    // the `error` event instead of an unhandled rejection (the caller cannot
+    // await a synchronous export).
+    state.queue.send(bytes).catch(err => {
+      this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)))
+    })
     return true
   }
 
@@ -367,6 +394,9 @@ export class RTCTransport<T = unknown> implements Transport<T> {
       this.pc
         .getStats()
         .then(report => {
+          // A closure (or a stopRttPolling that already cleared the cached
+          // value) must not be undone by an in-flight getStats resolution.
+          if (this.closed || this.rttTimer === undefined) return
           let best = 0
           report.forEach(entry => {
             if (
@@ -505,6 +535,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (this.emittedClose) return
     this.emittedClose = true
     this.clearConnectTimer()
+    this.stopRttPolling()
     for (const state of this.channelStates) {
       state.chunker.reset()
       state.queue.detach()

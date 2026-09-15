@@ -119,12 +119,21 @@ export class RTCDataChannelSendQueue {
    * would answer after the moment to resend has passed. Only meaningful with
    * {@link highWaterBytes} configured; without it, always sends and returns
    * true (legacy polling path has no drop policy).
+   *
+   * Never overtakes {@link send}: when older payloads are still queued, this
+   * appends behind them (snapshot included) and reports `true` — the payload
+   * was accepted and will flush in order.
    */
   trySend(data: SendPayload): boolean {
     const channel = this.channel
     if (!channel || channel.readyState !== "open") return false
     if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
       return false
+    }
+    if (this.highWaterBytes !== undefined && this.queue.length > 0) {
+      this.queue.push(snapshotPayload(data))
+      this.tryFlushAfterSend()
+      return true
     }
     channel.send(data)
     if (this.highWaterBytes === undefined) return true
@@ -137,6 +146,8 @@ export class RTCDataChannelSendQueue {
    * Send one payload. With {@link highWaterBytes} configured, payloads are queued
    * (never dropped) while the channel is at or above the high-water mark;
    * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
+   * Queued payloads always flush in FIFO order: while any older payload is
+   * still queued, new payloads append behind it rather than sending directly.
    */
   async send(data: SendPayload): Promise<void> {
     const channel = this.channel
@@ -151,6 +162,15 @@ export class RTCDataChannelSendQueue {
     if (channel.bufferedAmount >= this.highWaterBytes) {
       this.backpressured = true
       this.queue.push(snapshotPayload(data))
+      return
+    }
+
+    // Older payloads are still queued: append behind them instead of sending
+    // directly, so a drained channel (e.g. bufferedAmount fell without a
+    // `bufferedamountlow` event) can never let a new payload overtake them.
+    if (this.queue.length > 0) {
+      this.queue.push(snapshotPayload(data))
+      this.tryFlushAfterSend()
       return
     }
 

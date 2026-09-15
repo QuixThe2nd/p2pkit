@@ -9,6 +9,9 @@
 headers (`include/p2pkit-wasm/`), a `WebRtcTransport` C event-pump wrapper, and
 a game-generic browser bridge (`js/p2pkit_webrtc_glue.cjs`) that adapts the
 core `RTCTransport` (raw binary mode) to the lobby matchmaking dialect. The
-core stays MIT; everything under `emscripten/` is GPL-2.0 (see
-`emscripten/README.md` and `emscripten/LICENSE`). It is packaged via the
+core (`src/`, `dist/`) stays MIT; everything under `emscripten/` is GPL-2.0
+(see `emscripten/README.md` and `emscripten/LICENSE`). Because the published
+package ships both source sets, its `license` metadata reads
+`SEE LICENSE IN README.md`: each directory's files stay under their own
+license and per-file notices — nothing is relicensed. It is packaged via the
 `p2pkit/emscripten/*` export paths.

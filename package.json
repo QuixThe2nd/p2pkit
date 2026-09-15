@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "A transport-agnostic P2P mesh library. WebRTC, µTP, HTTP, or the DHT; gossip discovery, typed request/response, and message signing built in. Universal (browser + Node + Bun + Deno).",
   "type": "module",
-  "license": "MIT",
+  "license": "SEE LICENSE IN README.md",
   "sideEffects": false,
   "files": [
     "dist",
@@ -59,7 +59,9 @@
       "import": "./emscripten/js/p2pkit_webrtc_glue.cjs",
       "require": "./emscripten/js/p2pkit_webrtc_glue.cjs"
     },
-    "./emscripten/include/*": "./emscripten/include/*"
+    "./emscripten/include/*": "./emscripten/include/*",
+    "./emscripten/LICENSE": "./emscripten/LICENSE",
+    "./emscripten/README.md": "./emscripten/README.md"
   },
   "scripts": {
     "build": "tsup",

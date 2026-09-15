@@ -194,12 +194,21 @@ var P2PKIT_IIFE = (function (exports) {
      * would answer after the moment to resend has passed. Only meaningful with
      * {@link highWaterBytes} configured; without it, always sends and returns
      * true (legacy polling path has no drop policy).
+     *
+     * Never overtakes {@link send}: when older payloads are still queued, this
+     * appends behind them (snapshot included) and reports `true` — the payload
+     * was accepted and will flush in order.
      */
     trySend(data) {
       const channel = this.channel;
       if (!channel || channel.readyState !== "open") return false;
       if (this.highWaterBytes !== void 0 && channel.bufferedAmount >= this.highWaterBytes) {
         return false;
+      }
+      if (this.highWaterBytes !== void 0 && this.queue.length > 0) {
+        this.queue.push(snapshotPayload(data));
+        this.tryFlushAfterSend();
+        return true;
       }
       channel.send(data);
       if (this.highWaterBytes === void 0) return true;
@@ -211,6 +220,8 @@ var P2PKIT_IIFE = (function (exports) {
      * Send one payload. With {@link highWaterBytes} configured, payloads are queued
      * (never dropped) while the channel is at or above the high-water mark;
      * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
+     * Queued payloads always flush in FIFO order: while any older payload is
+     * still queued, new payloads append behind it rather than sending directly.
      */
     async send(data) {
       const channel = this.channel;
@@ -223,6 +234,11 @@ var P2PKIT_IIFE = (function (exports) {
       if (channel.bufferedAmount >= this.highWaterBytes) {
         this.backpressured = true;
         this.queue.push(snapshotPayload(data));
+        return;
+      }
+      if (this.queue.length > 0) {
+        this.queue.push(snapshotPayload(data));
+        this.tryFlushAfterSend();
         return;
       }
       channel.send(data);
@@ -268,6 +284,13 @@ var P2PKIT_IIFE = (function (exports) {
     code = "ERR_RTC_CONNECT_TIMEOUT";
     constructor(timeoutMs) {
       super(`RTC transport connect timed out after ${timeoutMs}ms`);
+    }
+  };
+  var RTCTransportBackpressureDropError = class extends Error {
+    name = "ErrorBackpressureDrop";
+    code = "ERR_RTC_BACKPRESSURE_DROP";
+    constructor(channelIndex) {
+      super(`RTC channel ${channelIndex} dropped raw payload under backpressure (drop mode)`);
     }
   };
   var RTCTransport = class {
@@ -368,10 +391,13 @@ var P2PKIT_IIFE = (function (exports) {
       await this.sendOn(0, value);
     }
     /**
-     * Send one value on the given channel. In raw mode (`raw: true`) binary
-     * payloads cross byte-for-byte and the promise resolves `false` when a
-     * `"drop"`-policy channel rejected the payload under backpressure (it never
-     * rejects for that reason). In the default JSON mode always resolves `true`.
+     * Send one value on the given channel; resolves `undefined` once the payload
+     * has been handed to the send queue (default JSON mode, preserving the
+     * historical `Promise<void>` contract). In raw mode (`raw: true`) binary
+     * payloads cross byte-for-byte: on `"drop"`-policy channels the promise
+     * rejects with {@link RTCTransportBackpressureDropError} when the payload is
+     * rejected under backpressure (use {@link trySendOn} for synchronous
+     * acceptance); on `"queue"`-policy channels it never rejects for that reason.
      */
     async sendOn(channelIndex, value) {
       const state = this.channelStates[channelIndex];
@@ -380,16 +406,18 @@ var P2PKIT_IIFE = (function (exports) {
       }
       if (this.raw) {
         const bytes = toUint8Array(value);
-        if (state.spec?.mode === "drop") return state.queue.trySend(bytes);
+        if (state.spec?.mode === "drop") {
+          if (!state.queue.trySend(bytes)) throw new RTCTransportBackpressureDropError(channelIndex);
+          return;
+        }
         await state.queue.send(bytes);
-        return true;
+        return;
       }
       const groupId = randomId(8);
       const data = JSON.stringify(value);
       for (const packet of state.chunker.split(groupId, data)) {
         await state.queue.send(packet);
       }
-      return true;
     }
     /**
      * Synchronous acceptance for raw mode: queues on `"queue"`-policy channels
@@ -407,7 +435,9 @@ var P2PKIT_IIFE = (function (exports) {
       if (!state || state.channel.readyState !== "open") return false;
       const bytes = toUint8Array(value);
       if (state.spec?.mode === "drop") return state.queue.trySend(bytes);
-      void state.queue.send(bytes);
+      state.queue.send(bytes).catch((err) => {
+        this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)));
+      });
       return true;
     }
     /**
@@ -477,6 +507,7 @@ var P2PKIT_IIFE = (function (exports) {
           return;
         }
         this.pc.getStats().then((report) => {
+          if (this.closed || this.rttTimer === void 0) return;
           let best = 0;
           report.forEach((entry) => {
             if (entry.type === "candidate-pair" && entry.state === "succeeded" && typeof entry.currentRoundTripTime === "number") {
@@ -595,6 +626,7 @@ var P2PKIT_IIFE = (function (exports) {
       if (this.emittedClose) return;
       this.emittedClose = true;
       this.clearConnectTimer();
+      this.stopRttPolling();
       for (const state of this.channelStates) {
         state.chunker.reset();
         state.queue.detach();
