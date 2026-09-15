@@ -1,6 +1,6 @@
-# DuneCity WebRTC Matchmaking Lobby
+# P2PKit Bootstrapping Server
 
-A minimal Node.js WebSocket service that pairs DuneCity players into WebRTC
+A minimal Node.js WebSocket service that pairs game peers into WebRTC
 peer-to-peer sessions. The first client that looks for a match waits; the next
 one is paired with it (FIFO). The server assigns the roles — the waiting client
 becomes the **host** (offerer), the newcomer the **joiner** (answerer) — and
