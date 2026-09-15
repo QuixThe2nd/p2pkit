@@ -1,4 +1,4 @@
-// DuneCity WebRTC signaling server: global matchmaking lobby.
+// P2PKit bootstrapping server: global matchmaking lobby.
 // {"t":"find"} queues; the next finder pairs with the waiter (server assigns
 // roles: waiter -> host, newcomer -> joiner). {"t":"sig"} relays an opaque
 // payload verbatim between the two paired peers. Socket close leaves; the
@@ -196,7 +196,7 @@ function main() {
   ctx.httpServer.listen(port, host, () => {
     const address = ctx.httpServer.address();
     const boundPort = typeof address === 'object' && address ? address.port : port;
-    console.log(`dunecity-mm-lobby listening on ws://${host}:${boundPort}/`);
+    console.log(`p2pkit-bootstrap listening on ws://${host}:${boundPort}/`);
   });
   const shutdown = () => ctx.close().then(() => process.exit(0));
   process.once('SIGINT', shutdown);
