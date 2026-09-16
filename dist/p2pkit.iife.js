@@ -57,11 +57,35 @@ var P2PKIT_IIFE = (function (exports) {
 
   // src/framing/index.ts
   var DEFAULT_MAX_PACKET_SIZE = 16e3;
+  var CHUNK_LIMITS = Object.freeze({
+    /** Maximum characters of payload per fragment (also the default `maxPacketSize`). */
+    packetChars: 16e3,
+    /** Maximum UTF-8 bytes of one whole message, counting characters and bytes. */
+    messageBytes: 1048576,
+    /** Maximum fragments (`n`) of one message. */
+    fragments: 128,
+    /** Maximum concurrently-incomplete messages kept in the inbox. */
+    pendingGroups: 16,
+    /** Maximum total UTF-8 bytes held across all incomplete messages. */
+    pendingBytes: 4194304,
+    /** A partially-received message older than this fails (see {@link Chunker.checkDeadline}). */
+    lifetimeMs: 15e3
+  });
+  function validId(id) {
+    return typeof id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+  }
+  var encoder = new TextEncoder();
   var Chunker = class {
     maxPacketSize;
+    hardened;
     inbox = /* @__PURE__ */ new Map();
+    bytes = 0;
     constructor(options = {}) {
+      this.hardened = options.hardened === true;
       this.maxPacketSize = options.maxPacketSize ?? DEFAULT_MAX_PACKET_SIZE;
+      if (this.hardened && (!Number.isSafeInteger(this.maxPacketSize) || this.maxPacketSize < 1 || this.maxPacketSize > CHUNK_LIMITS.packetChars)) {
+        throw new Error("Invalid chunk size");
+      }
     }
     /**
      * Split `data` into JSON-encoded {@link ChunkPacket}s under `id`. Always yields
@@ -69,24 +93,51 @@ var P2PKIT_IIFE = (function (exports) {
      * one transport message.
      */
     *split(id, data) {
+      if (this.hardened) {
+        if (!validId(id) || typeof data !== "string" || data.length > CHUNK_LIMITS.messageBytes || encoder.encode(data).length > CHUNK_LIMITS.messageBytes) {
+          throw new Error("Message too large");
+        }
+        const total = Math.max(1, Math.ceil(data.length / this.maxPacketSize));
+        if (total > CHUNK_LIMITS.fragments) throw new Error("Too many fragments");
+        yield* this.splitUnchecked(id, data, total);
+        return;
+      }
+      yield* this.splitUnchecked(id, data, data.length === 0 ? 1 : Math.ceil(data.length / this.maxPacketSize));
+    }
+    *splitUnchecked(id, data, n) {
       const size = this.maxPacketSize;
-      const n = data.length === 0 ? 1 : Math.ceil(data.length / size);
       for (let i = 0; i < n; i++) {
         const packet = { id, i, n, part: data.slice(i * size, (i + 1) * size) };
         yield JSON.stringify(packet);
       }
     }
     /**
+     * Fail if any partially-received message has been incomplete for longer than
+     * `CHUNK_LIMITS.lifetimeMs`. Called by hardened `ingest` on every fragment and
+     * by direct-mode transports on a timer, so a peer that goes silent mid-message
+     * cannot pin memory forever. No-op when nothing is pending.
+     */
+    checkDeadline(now = performance.now()) {
+      for (const entry of this.inbox.values()) {
+        if (now - entry.created >= CHUNK_LIMITS.lifetimeMs) throw new Error("Incomplete message expired");
+      }
+    }
+    /**
      * Feed one received {@link ChunkPacket}. Returns the fully reassembled string
      * once the final missing fragment arrives, otherwise `undefined`. Duplicate
      * fragments are ignored; fragments may arrive in any order.
+     *
+     * Hardened mode additionally validates the fragment's shape (throwing on
+     * malformed, conflicting or budget-exceeding input — never returning a
+     * corrupted payload) and enforces {@link CHUNK_LIMITS}.
      */
     ingest(packet) {
+      if (this.hardened) return this.ingestHardened(packet);
       const { id, i, n, part } = packet;
       if (n <= 1) return part;
       let entry = this.inbox.get(id);
       if (!entry) {
-        entry = { parts: new Array(n).fill(void 0), received: 0 };
+        entry = { parts: new Array(n).fill(void 0), received: 0, bytes: 0, created: 0 };
         this.inbox.set(id, entry);
       }
       if (i < 0 || i >= n) return void 0;
@@ -100,9 +151,43 @@ var P2PKIT_IIFE = (function (exports) {
       }
       return void 0;
     }
+    ingestHardened(packet) {
+      this.checkDeadline();
+      if (!packet || typeof packet !== "object" || Array.isArray(packet)) throw new Error("Invalid fragment");
+      const { id, i, n, part } = packet;
+      if (!validId(id) || !Number.isSafeInteger(n) || n < 1 || n > CHUNK_LIMITS.fragments || !Number.isSafeInteger(i) || i < 0 || i >= n || typeof part !== "string" || part.length > this.maxPacketSize) {
+        throw new Error("Invalid fragment");
+      }
+      let entry = this.inbox.get(id);
+      if (entry && entry.parts.length !== n) throw new Error("Fragment count changed");
+      const bytes = encoder.encode(part).length;
+      if (n === 1) return part;
+      if (!entry) {
+        if (this.inbox.size >= CHUNK_LIMITS.pendingGroups) throw new Error("Too many incomplete messages");
+        entry = { parts: new Array(n).fill(void 0), received: 0, bytes: 0, created: performance.now() };
+        this.inbox.set(id, entry);
+      }
+      const previous = entry.parts[i];
+      if (previous !== void 0) {
+        if (previous !== part) throw new Error("Conflicting fragment");
+        return void 0;
+      }
+      if (bytes > CHUNK_LIMITS.messageBytes - entry.bytes || bytes > CHUNK_LIMITS.pendingBytes - this.bytes) {
+        throw new Error("Reassembly budget exceeded");
+      }
+      entry.parts[i] = part;
+      entry.received++;
+      entry.bytes += bytes;
+      this.bytes += bytes;
+      if (entry.received !== n) return void 0;
+      this.inbox.delete(id);
+      this.bytes -= entry.bytes;
+      return entry.parts.join("");
+    }
     /** Drop any partially-received payloads (e.g. on disconnect). */
     reset() {
       this.inbox.clear();
+      this.bytes = 0;
     }
   };
 
@@ -142,7 +227,12 @@ var P2PKIT_IIFE = (function (exports) {
     highWaterBytes;
     lowWaterBytes;
     onDrain;
+    maxQueuedBytes;
+    maxQueuedJobs;
     queue = [];
+    jobs = [];
+    queuedBytes = 0;
+    jobTimer;
     lowHandler;
     flushing = false;
     backpressured = false;
@@ -154,6 +244,8 @@ var P2PKIT_IIFE = (function (exports) {
         this.lowWaterBytes = options.lowWaterBytes;
       }
       this.onDrain = options.onDrain;
+      this.maxQueuedBytes = options.maxQueuedBytes;
+      this.maxQueuedJobs = options.maxQueuedJobs;
     }
     /** Bind (or re-bind) this queue to a live data channel. */
     attach(channel) {
@@ -177,12 +269,17 @@ var P2PKIT_IIFE = (function (exports) {
       this.queue.length = 0;
       this.flushing = false;
       this.backpressured = false;
+      if (this.jobTimer !== void 0) {
+        clearTimeout(this.jobTimer);
+        this.jobTimer = void 0;
+      }
+      this.failJobs(new Error("RTC send queue detached before delivery"));
     }
     /** Channel `bufferedAmount` plus bytes still waiting in this queue. */
     get bufferedAmount() {
       let pending = 0;
       for (const item of this.queue) pending += payloadByteLength(item);
-      return (this.channel?.bufferedAmount ?? 0) + pending;
+      return (this.channel?.bufferedAmount ?? 0) + pending + this.queuedBytes;
     }
     /**
      * Synchronous, lossy send attempt: returns `false` (dropping the payload)
@@ -202,6 +299,7 @@ var P2PKIT_IIFE = (function (exports) {
     trySend(data) {
       const channel = this.channel;
       if (!channel || channel.readyState !== "open") return false;
+      if (this.jobs.length > 0) return this.tryJob([data]);
       if (this.highWaterBytes !== void 0 && channel.bufferedAmount >= this.highWaterBytes) {
         return false;
       }
@@ -226,6 +324,10 @@ var P2PKIT_IIFE = (function (exports) {
     async send(data) {
       const channel = this.channel;
       if (!channel || channel.readyState !== "open") throw new Error("RTC data channel is not open");
+      if (this.jobs.length > 0) {
+        await this.sendJob([data]);
+        return;
+      }
       if (this.highWaterBytes === void 0) {
         channel.send(data);
         await this.pollFlush(channel);
@@ -244,6 +346,97 @@ var P2PKIT_IIFE = (function (exports) {
       channel.send(data);
       if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
       else this.tryFlushAfterSend();
+    }
+    /**
+     * Opt-in job API for bounded, lossless consumers (direct-mode
+     * {@link RTCTransport} in `src/transports/rtc.ts`): submit a burst of payloads
+     * as ONE first-in-first-out unit — every payload of a job is handed to
+     * `channel.send()` in order, and no later job's payload is sent before an
+     * earlier job has fully drained, so whole messages keep their order on the
+     * wire. The promise resolves only after the last payload was actually handed
+     * to the channel (not merely accepted while backpressured), and rejects —
+     * without sending anything further — when the job would exceed
+     * {@link maxQueuedBytes}/{@link maxQueuedJobs} retention, when the channel is
+     * or becomes unusable, or when the queue detaches first ({@link detach}).
+     *
+     * While the channel sits above the high-water mark, delivery retries on a
+     * short poll timer (bounded: the timer only lives while jobs are pending), so
+     * progress does not depend solely on `bufferedamountlow` firing.
+     */
+    sendJob(payloads) {
+      return new Promise((resolve, reject) => {
+        this.enqueueJob(payloads, resolve, reject);
+      });
+    }
+    /**
+     * Synchronous counterpart to {@link sendJob} (same bounded acceptance, same
+     * FIFO): returns whether the job was accepted by this bounded queue — never a
+     * promise masquerading as success. Settlement is silent: delivery completes
+     * unnoticed and rejection surfaces nowhere, matching producers that cannot
+     * await (e.g. Emscripten `ccall` bridges).
+     */
+    tryJob(payloads) {
+      return this.enqueueJob(
+        payloads,
+        () => {
+        },
+        () => {
+        }
+      );
+    }
+    enqueueJob(payloads, resolve, reject) {
+      const channel = this.channel;
+      if (!channel || channel.readyState !== "open") {
+        reject(new Error("RTC data channel is not open"));
+        return false;
+      }
+      if (payloads.length === 0) {
+        resolve();
+        return true;
+      }
+      const snapshot = payloads.map(snapshotPayload);
+      const bytes = snapshot.reduce((total, item) => total + payloadByteLength(item), 0);
+      if (this.maxQueuedBytes !== void 0 && this.queuedBytes + bytes > this.maxQueuedBytes || this.maxQueuedJobs !== void 0 && this.jobs.length >= this.maxQueuedJobs) {
+        reject(new Error("RTC send queue retention limit exceeded"));
+        return false;
+      }
+      this.jobs.push({ payloads: snapshot, bytes, next: 0, resolve, reject });
+      this.queuedBytes += bytes;
+      this.drainJobs();
+      return true;
+    }
+    drainJobs() {
+      if (this.jobTimer !== void 0) {
+        clearTimeout(this.jobTimer);
+        this.jobTimer = void 0;
+      }
+      while (this.jobs.length > 0) {
+        const channel = this.channel;
+        if (!channel || channel.readyState !== "open") {
+          this.failJobs(new Error("RTC data channel is not open"));
+          return;
+        }
+        const limit = this.highWaterBytes ?? RTC_SEND_QUEUE_FLUSH_THRESHOLD;
+        const job = this.jobs[0];
+        while (job.next < job.payloads.length) {
+          if (channel.bufferedAmount > limit) {
+            this.jobTimer = setTimeout(() => this.drainJobs(), 10);
+            if (typeof this.jobTimer === "object" && this.jobTimer && typeof this.jobTimer.unref === "function") {
+              this.jobTimer.unref();
+            }
+            return;
+          }
+          channel.send(job.payloads[job.next++]);
+        }
+        this.jobs.shift();
+        this.queuedBytes -= job.bytes;
+        job.resolve();
+      }
+    }
+    failJobs(error) {
+      if (this.jobs.length === 0) return;
+      this.queuedBytes = 0;
+      for (const job of this.jobs.splice(0)) job.reject(error);
     }
     async pollFlush(channel) {
       while (channel.readyState === "open" && channel.bufferedAmount > RTC_SEND_QUEUE_FLUSH_THRESHOLD) {
@@ -273,11 +466,59 @@ var P2PKIT_IIFE = (function (exports) {
   };
 
   // src/transports/rtc.ts
+  var DIRECT_MAX_BUFFERED = 1 << 20;
+  var DIRECT_MAX_OUTGOING_BYTES = 4 << 20;
+  var DIRECT_MAX_OUTGOING_MESSAGES = 128;
+  var DIRECT_MAX_SIGNALS = 128;
+  var DIRECT_MAX_SDP = 65536;
+  var DIRECT_MAX_CANDIDATE = 2048;
+  var DIRECT_MAX_FRAME_BYTES = 131072;
+  var DIRECT_MAX_PACKETS_PER_SECOND = 4096;
+  var DIRECT_MAX_BYTES_PER_SECOND = 16 * 1024 * 1024;
+  function directIceServers(servers) {
+    if (!Array.isArray(servers) || servers.length > 8) throw new Error("Invalid STUN configuration");
+    return servers.map((server) => {
+      const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
+      if (!Array.isArray(urls) || urls.length === 0 || urls.length > 8 || server.username || server.credential || urls.some(
+        (url) => typeof url !== "string" || url.length > 256 || !/^stuns?:[a-zA-Z0-9.\[\]:-]+$/.test(url)
+      )) {
+        throw new Error("Only STUN is supported for direct play");
+      }
+      return { urls: [...urls] };
+    });
+  }
+  function validateDirectCandidate(candidate) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new Error("Invalid ICE candidate");
+    }
+    const { candidate: value, sdpMid, sdpMLineIndex } = candidate;
+    if (typeof value !== "string" || value.length > DIRECT_MAX_CANDIDATE || /[\r\n\0]/.test(value) || value !== "" && (!value.startsWith("candidate:") || /\styp\s+relay(?:\s|$)/.test(value) || !/\styp (host|srflx|prflx)(?:\s|$)/.test(value)) || sdpMid !== void 0 && sdpMid !== null && (typeof sdpMid !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(sdpMid)) || sdpMLineIndex !== void 0 && sdpMLineIndex !== null && (!Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 16)) {
+      throw new Error("Invalid direct ICE candidate");
+    }
+  }
+  function validateDirectDescription(description) {
+    if (!description || typeof description !== "object") throw new Error("Invalid session description");
+    const { type, sdp } = description;
+    if (type !== "offer" && type !== "answer" || typeof sdp !== "string" || sdp.length > DIRECT_MAX_SDP || sdp.includes("\0") || !/^v=0\r?\n/.test(sdp) || !/^a=fingerprint:sha-256 (?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}\r?$/m.test(sdp) || (sdp.match(/^a=fingerprint:/gm)?.length ?? 0) !== 1 || (sdp.match(/^m=application /gm)?.length ?? 0) !== 1 || /^m=(?!application )/m.test(sdp)) {
+      throw new Error("Invalid data-channel description");
+    }
+    let count = 0;
+    for (const line of sdp.split(/\r?\n/)) {
+      if (line.startsWith("a=candidate:")) {
+        if (++count > DIRECT_MAX_SIGNALS) throw new Error("Too many ICE candidates");
+        validateDirectCandidate({ candidate: line.slice(2) });
+      }
+    }
+  }
   function toUint8Array(value) {
     if (value instanceof Uint8Array) return value;
     if (value instanceof ArrayBuffer) return new Uint8Array(value);
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     throw new Error("raw RTC payloads must be an ArrayBuffer or ArrayBufferView");
+  }
+  var textEncoder = new TextEncoder();
+  function isFullyReliable(value) {
+    return value === null || value === 65535;
   }
   var RTCTransportConnectTimeoutError = class extends Error {
     name = "ErrorTimeout";
@@ -312,6 +553,13 @@ var P2PKIT_IIFE = (function (exports) {
     closed = false;
     emittedClose = false;
     raw;
+    direct;
+    initiator;
+    signalCount = 0;
+    candidateCount = 0;
+    signalChain = Promise.resolve();
+    unsubscribeSignalling;
+    expiryTimer;
     rttMs = 0;
     rttTimer;
     constructor(options) {
@@ -322,13 +570,36 @@ var P2PKIT_IIFE = (function (exports) {
       this.expectedChannelCount = options.channels?.length ?? 1;
       this.connectTimeoutMs = options.connectTimeoutMs;
       this.raw = options.raw === true;
-      const iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
+      this.direct = options.direct === true;
+      this.initiator = options.initiator;
+      if (this.direct && options.channels) {
+        throw new Error("direct mode uses a single ordered/reliable channel; channels is not supported");
+      }
+      if (this.direct && this.raw) {
+        throw new Error("direct mode sends JSON values; raw is not supported");
+      }
+      const iceServers = this.direct ? directIceServers(options.iceServers ?? DEFAULT_ICE_SERVERS) : options.iceServers ?? DEFAULT_ICE_SERVERS;
       this.pc = new options.backend.RTCPeerConnection({ iceServers });
       if (this.connectTimeoutMs !== void 0) {
         this.connectTimer = setTimeout(() => this.handleConnectTimeout(), this.connectTimeoutMs);
       }
       this.pc.onicecandidate = (ev) => {
         if (ev.candidate) {
+          if (this.direct) {
+            try {
+              const candidate = ev.candidate.toJSON();
+              validateDirectCandidate(candidate);
+              if (candidate.candidate === "") return;
+              this.signalling.send({
+                iceCandidate: candidate,
+                from: this.self,
+                to: this.remote
+              });
+            } catch {
+              this.failClosed("Could not exchange direct connection details");
+            }
+            return;
+          }
           this.signalling.send({
             iceCandidate: ev.candidate.toJSON(),
             from: this.self,
@@ -356,11 +627,14 @@ var P2PKIT_IIFE = (function (exports) {
         } else {
           this.setupChannel(
             0,
-            this.pc.createDataChannel(options.label ?? "p2pkit"),
+            this.pc.createDataChannel(
+              options.label ?? "p2pkit",
+              this.direct ? { ordered: true } : void 0
+            ),
             options
           );
         }
-        void this.negotiate();
+        void (this.direct ? this.negotiate().catch(() => this.failClosed("Direct connection negotiation failed")) : this.negotiate());
       } else {
         this.pc.ondatachannel = (ev) => {
           const label = ev.channel.label;
@@ -373,7 +647,26 @@ var P2PKIT_IIFE = (function (exports) {
           }
         };
       }
-      this.signalling.onMessage(this.onSignal);
+      if (this.direct) {
+        this.expiryTimer = setInterval(() => {
+          if (this.closed || this.emittedClose) {
+            this.stopExpiryTimer();
+            return;
+          }
+          try {
+            for (const state of this.channelStates) state.chunker.checkDeadline();
+          } catch {
+            this.failClosed("A peer sent an incomplete message");
+          }
+        }, 1e3);
+        if (typeof this.expiryTimer === "object" && this.expiryTimer && typeof this.expiryTimer.unref === "function") {
+          this.expiryTimer.unref();
+        }
+      }
+      const unsubscribe = this.signalling.onMessage(this.onSignal);
+      if (this.direct && typeof unsubscribe === "function") {
+        this.unsubscribeSignalling = unsubscribe;
+      }
     }
     get bufferedAmount() {
       let total = 0;
@@ -413,10 +706,45 @@ var P2PKIT_IIFE = (function (exports) {
         await state.queue.send(bytes);
         return;
       }
+      if (this.direct) {
+        const packets = [...state.chunker.split(randomId(8), JSON.stringify(value))];
+        try {
+          await state.queue.sendJob(packets);
+        } catch (err) {
+          this.failClosed("Direct connection send queue is full");
+          throw err;
+        }
+        return;
+      }
       const groupId = randomId(8);
       const data = JSON.stringify(value);
       for (const packet of state.chunker.split(groupId, data)) {
         await state.queue.send(packet);
+      }
+    }
+    /**
+     * Synchronous bounded acceptance for direct-mode JSON sends: the value is
+     * fragmented and handed to the channel's bounded job queue, and this returns
+     * whether it was accepted — never a promise masquerading as success. Delivery
+     * completes silently (a synchronous producer, e.g. an Emscripten `ccall`
+     * bridge, cannot await); the link's health, including a later close that
+     * abandons an accepted job, surfaces on the `error`/`disconnect` events.
+     * A value that cannot be framed under the hardened limits fails the link
+     * (fail-closed, like the send-queue bound) and returns `false`.
+     *
+     * Throws outside direct mode (`options.direct`), which is the JSON-mode
+     * counterpart of {@link trySendOn}'s raw-mode guard.
+     */
+    trySend(value) {
+      if (!this.direct) throw new Error("trySend requires direct mode (options.direct)");
+      const state = this.channelStates[0];
+      if (!state || state.channel.readyState !== "open") return false;
+      try {
+        const packets = [...state.chunker.split(randomId(8), JSON.stringify(value))];
+        return state.queue.tryJob(packets);
+      } catch {
+        this.failClosed("Direct connection could not deliver a message");
+        return false;
       }
     }
     /**
@@ -455,6 +783,7 @@ var P2PKIT_IIFE = (function (exports) {
       this.closed = true;
       this.clearConnectTimer();
       this.stopRttPolling();
+      this.stopExpiryTimer();
       for (const state of this.channelStates) {
         state.queue.detach();
         try {
@@ -468,15 +797,50 @@ var P2PKIT_IIFE = (function (exports) {
       }
       this.handleClose();
     }
+    /**
+     * Direct-mode fail-closed path: emit the cause once, then tear the link down
+     * (`disconnect` emits the single `disconnect`; pending send jobs are rejected
+     * by their queue detaching).
+     */
+    failClosed(message) {
+      if (this.closed || this.emittedClose) return;
+      try {
+        this.emitter.emit("error", new Error(message));
+      } finally {
+        this.disconnect();
+      }
+    }
+    stopExpiryTimer() {
+      if (this.expiryTimer !== void 0) {
+        clearInterval(this.expiryTimer);
+        this.expiryTimer = void 0;
+      }
+    }
     setupChannel(index, channel, options) {
-      const chunker = new Chunker({ maxPacketSize: options.chunkSize });
+      if (this.direct && (channel.label !== (options.label ?? "p2pkit") || !channel.ordered || !isFullyReliable(channel.maxRetransmits) || !isFullyReliable(channel.maxPacketLifeTime))) {
+        try {
+          channel.close();
+        } catch {
+        }
+        this.failClosed("Invalid direct game channel");
+        return;
+      }
+      const chunker = new Chunker({ maxPacketSize: options.chunkSize, hardened: this.direct });
       const queue = new RTCDataChannelSendQueue({
-        highWaterBytes: options.channels?.[index]?.highWaterBytes ?? options.highWaterBytes,
+        highWaterBytes: options.channels?.[index]?.highWaterBytes ?? options.highWaterBytes ?? (this.direct ? DIRECT_MAX_BUFFERED : void 0),
         lowWaterBytes: options.channels?.[index]?.lowWaterBytes ?? options.lowWaterBytes,
-        onDrain: () => this.emitter.emit("drain", index)
+        onDrain: () => this.emitter.emit("drain", index),
+        maxQueuedBytes: this.direct ? DIRECT_MAX_OUTGOING_BYTES : void 0,
+        maxQueuedJobs: this.direct ? DIRECT_MAX_OUTGOING_MESSAGES : void 0
       });
       queue.attach(channel);
-      this.channelStates[index] = { channel, queue, chunker, spec: this.channelSpecs?.[index] };
+      this.channelStates[index] = {
+        channel,
+        queue,
+        chunker,
+        spec: this.channelSpecs?.[index],
+        traffic: this.direct ? { start: performance.now(), packets: 0, bytes: 0 } : void 0
+      };
       try {
         channel.binaryType = "arraybuffer";
       } catch {
@@ -541,6 +905,7 @@ var P2PKIT_IIFE = (function (exports) {
       this.closed = true;
       this.clearConnectTimer();
       this.stopRttPolling();
+      this.stopExpiryTimer();
       this.emitter.emit("error", new RTCTransportConnectTimeoutError(this.connectTimeoutMs));
       for (const state of this.channelStates) {
         state.queue.detach();
@@ -564,6 +929,7 @@ var P2PKIT_IIFE = (function (exports) {
     sendDescription() {
       const description = this.pc.localDescription;
       if (!description) return;
+      if (this.direct) validateDirectDescription(description);
       this.signalling.send({
         description: { type: description.type, sdp: description.sdp },
         from: this.self,
@@ -571,12 +937,35 @@ var P2PKIT_IIFE = (function (exports) {
       });
     }
     onSignal = (message) => {
+      if (this.direct) {
+        if (this.closed || this.emittedClose) return;
+        if (!message || typeof message !== "object" || !("to" in message) || message.from !== this.remote || message.to !== this.self) {
+          return;
+        }
+        if (++this.signalCount > DIRECT_MAX_SIGNALS) {
+          this.signalCount--;
+          this.failClosed("Too many connection messages");
+          return;
+        }
+        this.signalChain = this.signalChain.then(() => this.handleSignal(message)).catch(() => {
+          if (!this.closed && !this.emittedClose) this.failClosed("Invalid direct connection details");
+        }).finally(() => {
+          this.signalCount--;
+        });
+        return;
+      }
       void this.handleSignal(message);
     };
     async handleSignal(message) {
       if (this.closed) return;
       if ("description" in message) {
         if (message.from !== this.remote || message.to !== this.self) return;
+        if (this.direct) {
+          validateDirectDescription(message.description);
+          if (this.remoteDescriptionSet || message.description.type !== (this.initiator ? "answer" : "offer")) {
+            throw new Error("Unexpected description");
+          }
+        }
         await this.pc.setRemoteDescription(message.description);
         this.remoteDescriptionSet = true;
         await this.flushCandidates();
@@ -587,6 +976,10 @@ var P2PKIT_IIFE = (function (exports) {
         }
       } else if ("iceCandidate" in message) {
         if (message.from !== this.remote || message.to !== this.self) return;
+        if (this.direct) {
+          validateDirectCandidate(message.iceCandidate);
+          if (++this.candidateCount > DIRECT_MAX_SIGNALS) throw new Error("Too many candidates");
+        }
         if (this.remoteDescriptionSet) await this.pc.addIceCandidate(message.iceCandidate);
         else this.pendingCandidates.push(message.iceCandidate);
       }
@@ -608,6 +1001,31 @@ var P2PKIT_IIFE = (function (exports) {
         this.emitter.emit("message", bytes, channelIndex);
         return;
       }
+      if (this.direct) {
+        try {
+          if ((typeof data === "string" ? data.length : data.byteLength) > DIRECT_MAX_FRAME_BYTES) {
+            throw new Error("Oversized fragment");
+          }
+          const raw2 = typeof data === "string" ? data : new TextDecoder("utf-8", { fatal: true }).decode(data);
+          const traffic = state.traffic ??= { start: performance.now(), packets: 0, bytes: 0 };
+          const now = performance.now();
+          if (now - traffic.start >= 1e3) {
+            traffic.start = now;
+            traffic.packets = 0;
+            traffic.bytes = 0;
+          }
+          traffic.packets++;
+          traffic.bytes += typeof data === "string" ? textEncoder.encode(raw2).length : data.byteLength;
+          if (traffic.packets > DIRECT_MAX_PACKETS_PER_SECOND || traffic.bytes > DIRECT_MAX_BYTES_PER_SECOND) {
+            throw new Error("Peer traffic limit exceeded");
+          }
+          const full2 = state.chunker.ingest(JSON.parse(raw2));
+          if (full2 !== void 0) this.emitter.emit("message", JSON.parse(full2), channelIndex);
+        } catch {
+          this.failClosed("A peer sent an invalid game frame");
+        }
+        return;
+      }
       const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
       let packet;
       try {
@@ -627,6 +1045,15 @@ var P2PKIT_IIFE = (function (exports) {
       this.emittedClose = true;
       this.clearConnectTimer();
       this.stopRttPolling();
+      this.stopExpiryTimer();
+      if (this.unsubscribeSignalling) {
+        const unsubscribe = this.unsubscribeSignalling;
+        this.unsubscribeSignalling = void 0;
+        try {
+          unsubscribe();
+        } catch {
+        }
+      }
       for (const state of this.channelStates) {
         state.chunker.reset();
         state.queue.detach();
@@ -655,9 +1082,12 @@ var P2PKIT_IIFE = (function (exports) {
   exports.RTC_SEND_QUEUE_FLUSH_THRESHOLD = RTC_SEND_QUEUE_FLUSH_THRESHOLD;
   exports.capsFor = capsFor;
   exports.chooseTransport = chooseTransport;
+  exports.directIceServers = directIceServers;
   exports.extractIP = extractIP;
   exports.isInitiator = isInitiator;
   exports.randomId = randomId;
+  exports.validateDirectCandidate = validateDirectCandidate;
+  exports.validateDirectDescription = validateDirectDescription;
 
   return exports;
 

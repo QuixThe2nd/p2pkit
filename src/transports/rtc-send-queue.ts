@@ -19,12 +19,36 @@ export interface RTCDataChannelSendQueueOptions {
   lowWaterBytes?: number
   /** Invoked once the internal send queue has fully drained after backpressure. */
   onDrain?: () => void
+  /**
+   * Opt-in bounded-retention contract for the job API
+   * ({@link RTCDataChannelSendQueue.sendJob}/{@link RTCDataChannelSendQueue.tryJob}):
+   * a job whose payload bytes would push queued-but-undelivered bytes past this
+   * limit is rejected instead of buffered, so a saturated channel can never grow
+   * this queue without bound. Default: unbounded (matching the historical
+   * watermark queue).
+   */
+  maxQueuedBytes?: number
+  /**
+   * Opt-in companion to {@link maxQueuedBytes}: rejects a job when this many
+   * jobs are already queued-but-undelivered, bounding queue entries however
+   * small their payloads are.
+   */
+  maxQueuedJobs?: number
 }
 
 /** Default polling threshold when {@link highWaterBytes} is not configured. */
 export const RTC_SEND_QUEUE_FLUSH_THRESHOLD = 1 << 20 // 1 MB
 
 type SendPayload = string | ArrayBuffer | ArrayBufferView
+
+/** One multi-payload send submitted as a unit through the job API. */
+interface QueuedJob {
+  payloads: SendPayload[]
+  bytes: number
+  next: number
+  resolve: () => void
+  reject: (error: Error) => void
+}
 
 function payloadByteLength(data: SendPayload): number {
   if (typeof data === "string") return data.length
@@ -60,7 +84,12 @@ export class RTCDataChannelSendQueue {
   private readonly highWaterBytes?: number
   private readonly lowWaterBytes?: number
   private readonly onDrain?: () => void
+  private readonly maxQueuedBytes?: number
+  private readonly maxQueuedJobs?: number
   private readonly queue: SendPayload[] = []
+  private readonly jobs: QueuedJob[] = []
+  private queuedBytes = 0
+  private jobTimer?: ReturnType<typeof setTimeout>
   private lowHandler?: () => void
   private flushing = false
   private backpressured = false
@@ -74,6 +103,8 @@ export class RTCDataChannelSendQueue {
       this.lowWaterBytes = options.lowWaterBytes
     }
     this.onDrain = options.onDrain
+    this.maxQueuedBytes = options.maxQueuedBytes
+    this.maxQueuedJobs = options.maxQueuedJobs
   }
 
   /** Bind (or re-bind) this queue to a live data channel. */
@@ -100,13 +131,18 @@ export class RTCDataChannelSendQueue {
     this.queue.length = 0
     this.flushing = false
     this.backpressured = false
+    if (this.jobTimer !== undefined) {
+      clearTimeout(this.jobTimer)
+      this.jobTimer = undefined
+    }
+    this.failJobs(new Error("RTC send queue detached before delivery"))
   }
 
   /** Channel `bufferedAmount` plus bytes still waiting in this queue. */
   get bufferedAmount(): number {
     let pending = 0
     for (const item of this.queue) pending += payloadByteLength(item)
-    return (this.channel?.bufferedAmount ?? 0) + pending
+    return (this.channel?.bufferedAmount ?? 0) + pending + this.queuedBytes
   }
 
   /**
@@ -127,6 +163,9 @@ export class RTCDataChannelSendQueue {
   trySend(data: SendPayload): boolean {
     const channel = this.channel
     if (!channel || channel.readyState !== "open") return false
+    // Never overtake jobs: while any job payload is still queued, append behind
+    // it as a job so FIFO holds across mixed API use.
+    if (this.jobs.length > 0) return this.tryJob([data])
     if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
       return false
     }
@@ -153,6 +192,12 @@ export class RTCDataChannelSendQueue {
     const channel = this.channel
     if (!channel || channel.readyState !== "open") throw new Error("RTC data channel is not open")
 
+    // Preserve FIFO across mixed API use: a payload cannot overtake queued jobs.
+    if (this.jobs.length > 0) {
+      await this.sendJob([data])
+      return
+    }
+
     if (this.highWaterBytes === undefined) {
       channel.send(data)
       await this.pollFlush(channel)
@@ -177,6 +222,107 @@ export class RTCDataChannelSendQueue {
     channel.send(data)
     if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true
     else this.tryFlushAfterSend()
+  }
+
+  /**
+   * Opt-in job API for bounded, lossless consumers (direct-mode
+   * {@link RTCTransport} in `src/transports/rtc.ts`): submit a burst of payloads
+   * as ONE first-in-first-out unit — every payload of a job is handed to
+   * `channel.send()` in order, and no later job's payload is sent before an
+   * earlier job has fully drained, so whole messages keep their order on the
+   * wire. The promise resolves only after the last payload was actually handed
+   * to the channel (not merely accepted while backpressured), and rejects —
+   * without sending anything further — when the job would exceed
+   * {@link maxQueuedBytes}/{@link maxQueuedJobs} retention, when the channel is
+   * or becomes unusable, or when the queue detaches first ({@link detach}).
+   *
+   * While the channel sits above the high-water mark, delivery retries on a
+   * short poll timer (bounded: the timer only lives while jobs are pending), so
+   * progress does not depend solely on `bufferedamountlow` firing.
+   */
+  sendJob(payloads: SendPayload[]): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.enqueueJob(payloads, resolve, reject)
+    })
+  }
+
+  /**
+   * Synchronous counterpart to {@link sendJob} (same bounded acceptance, same
+   * FIFO): returns whether the job was accepted by this bounded queue — never a
+   * promise masquerading as success. Settlement is silent: delivery completes
+   * unnoticed and rejection surfaces nowhere, matching producers that cannot
+   * await (e.g. Emscripten `ccall` bridges).
+   */
+  tryJob(payloads: SendPayload[]): boolean {
+    return this.enqueueJob(
+      payloads,
+      () => {},
+      () => {},
+    )
+  }
+
+  private enqueueJob(
+    payloads: SendPayload[],
+    resolve: () => void,
+    reject: (error: Error) => void,
+  ): boolean {
+    const channel = this.channel
+    if (!channel || channel.readyState !== "open") {
+      reject(new Error("RTC data channel is not open"))
+      return false
+    }
+    if (payloads.length === 0) {
+      resolve()
+      return true
+    }
+    const snapshot = payloads.map(snapshotPayload)
+    const bytes = snapshot.reduce((total, item) => total + payloadByteLength(item), 0)
+    if (
+      (this.maxQueuedBytes !== undefined && this.queuedBytes + bytes > this.maxQueuedBytes) ||
+      (this.maxQueuedJobs !== undefined && this.jobs.length >= this.maxQueuedJobs)
+    ) {
+      reject(new Error("RTC send queue retention limit exceeded"))
+      return false
+    }
+    this.jobs.push({ payloads: snapshot, bytes, next: 0, resolve, reject })
+    this.queuedBytes += bytes
+    this.drainJobs()
+    return true
+  }
+
+  private drainJobs(): void {
+    if (this.jobTimer !== undefined) {
+      clearTimeout(this.jobTimer)
+      this.jobTimer = undefined
+    }
+    while (this.jobs.length > 0) {
+      const channel = this.channel
+      if (!channel || channel.readyState !== "open") {
+        this.failJobs(new Error("RTC data channel is not open"))
+        return
+      }
+      const limit = this.highWaterBytes ?? RTC_SEND_QUEUE_FLUSH_THRESHOLD
+      const job = this.jobs[0]!
+      while (job.next < job.payloads.length) {
+        if (channel.bufferedAmount > limit) {
+          this.jobTimer = setTimeout(() => this.drainJobs(), 10)
+          if (typeof this.jobTimer === "object" && this.jobTimer && typeof this.jobTimer.unref === "function") {
+            this.jobTimer.unref()
+          }
+          return
+        }
+        channel.send(job.payloads[job.next++]!)
+      }
+      this.jobs.shift()
+      this.queuedBytes -= job.bytes
+      job.resolve()
+    }
+  }
+
+  private failJobs(error: Error): void {
+    if (this.jobs.length === 0) return
+    this.queuedBytes = 0
+    for (const job of this.jobs.splice(0)) job.reject(error)
   }
 
   private async pollFlush(channel: RTCDataChannelLike): Promise<void> {
