@@ -130,6 +130,13 @@ var P2PKIT_IIFE = (function (exports) {
     if (data instanceof ArrayBuffer) return data.byteLength;
     return data.byteLength;
   }
+  function snapshotPayload(data) {
+    if (typeof data === "string") return data;
+    const view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const copy = new Uint8Array(view.byteLength);
+    copy.set(view);
+    return copy;
+  }
   var RTCDataChannelSendQueue = class {
     channel;
     highWaterBytes;
@@ -178,9 +185,43 @@ var P2PKIT_IIFE = (function (exports) {
       return (this.channel?.bufferedAmount ?? 0) + pending;
     }
     /**
+     * Synchronous, lossy send attempt: returns `false` (dropping the payload)
+     * when the channel is at or above the high-water mark, instead of queueing.
+     *
+     * Why this exists beside the async {@link send}: Emscripten `ccall` exports
+     * (and other synchronous producers of lossy, time-sensitive traffic such as
+     * per-tick game state) must learn acceptance in the same tick — a promise
+     * would answer after the moment to resend has passed. Only meaningful with
+     * {@link highWaterBytes} configured; without it, always sends and returns
+     * true (legacy polling path has no drop policy).
+     *
+     * Never overtakes {@link send}: when older payloads are still queued, this
+     * appends behind them (snapshot included) and reports `true` — the payload
+     * was accepted and will flush in order.
+     */
+    trySend(data) {
+      const channel = this.channel;
+      if (!channel || channel.readyState !== "open") return false;
+      if (this.highWaterBytes !== void 0 && channel.bufferedAmount >= this.highWaterBytes) {
+        return false;
+      }
+      if (this.highWaterBytes !== void 0 && this.queue.length > 0) {
+        this.queue.push(snapshotPayload(data));
+        this.tryFlushAfterSend();
+        return true;
+      }
+      channel.send(data);
+      if (this.highWaterBytes === void 0) return true;
+      if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
+      else this.tryFlushAfterSend();
+      return true;
+    }
+    /**
      * Send one payload. With {@link highWaterBytes} configured, payloads are queued
      * (never dropped) while the channel is at or above the high-water mark;
      * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
+     * Queued payloads always flush in FIFO order: while any older payload is
+     * still queued, new payloads append behind it rather than sending directly.
      */
     async send(data) {
       const channel = this.channel;
@@ -192,7 +233,12 @@ var P2PKIT_IIFE = (function (exports) {
       }
       if (channel.bufferedAmount >= this.highWaterBytes) {
         this.backpressured = true;
-        this.queue.push(data);
+        this.queue.push(snapshotPayload(data));
+        return;
+      }
+      if (this.queue.length > 0) {
+        this.queue.push(snapshotPayload(data));
+        this.tryFlushAfterSend();
         return;
       }
       channel.send(data);
@@ -227,11 +273,24 @@ var P2PKIT_IIFE = (function (exports) {
   };
 
   // src/transports/rtc.ts
+  function toUint8Array(value) {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    throw new Error("raw RTC payloads must be an ArrayBuffer or ArrayBufferView");
+  }
   var RTCTransportConnectTimeoutError = class extends Error {
     name = "ErrorTimeout";
     code = "ERR_RTC_CONNECT_TIMEOUT";
     constructor(timeoutMs) {
       super(`RTC transport connect timed out after ${timeoutMs}ms`);
+    }
+  };
+  var RTCTransportBackpressureDropError = class extends Error {
+    name = "ErrorBackpressureDrop";
+    code = "ERR_RTC_BACKPRESSURE_DROP";
+    constructor(channelIndex) {
+      super(`RTC channel ${channelIndex} dropped raw payload under backpressure (drop mode)`);
     }
   };
   var RTCTransport = class {
@@ -252,6 +311,9 @@ var P2PKIT_IIFE = (function (exports) {
     pendingCandidates = [];
     closed = false;
     emittedClose = false;
+    raw;
+    rttMs = 0;
+    rttTimer;
     constructor(options) {
       this.self = options.self;
       this.remote = options.remote;
@@ -259,6 +321,7 @@ var P2PKIT_IIFE = (function (exports) {
       this.channelSpecs = options.channels;
       this.expectedChannelCount = options.channels?.length ?? 1;
       this.connectTimeoutMs = options.connectTimeoutMs;
+      this.raw = options.raw === true;
       const iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS;
       this.pc = new options.backend.RTCPeerConnection({ iceServers });
       if (this.connectTimeoutMs !== void 0) {
@@ -325,12 +388,30 @@ var P2PKIT_IIFE = (function (exports) {
       this.emitter.on(event, handler);
     }
     async send(value) {
-      return this.sendOn(0, value);
+      await this.sendOn(0, value);
     }
+    /**
+     * Send one value on the given channel; resolves `undefined` once the payload
+     * has been handed to the send queue (default JSON mode, preserving the
+     * historical `Promise<void>` contract). In raw mode (`raw: true`) binary
+     * payloads cross byte-for-byte: on `"drop"`-policy channels the promise
+     * rejects with {@link RTCTransportBackpressureDropError} when the payload is
+     * rejected under backpressure (use {@link trySendOn} for synchronous
+     * acceptance); on `"queue"`-policy channels it never rejects for that reason.
+     */
     async sendOn(channelIndex, value) {
       const state = this.channelStates[channelIndex];
       if (!state || state.channel.readyState !== "open") {
         throw new Error("RTC transport is not open");
+      }
+      if (this.raw) {
+        const bytes = toUint8Array(value);
+        if (state.spec?.mode === "drop") {
+          if (!state.queue.trySend(bytes)) throw new RTCTransportBackpressureDropError(channelIndex);
+          return;
+        }
+        await state.queue.send(bytes);
+        return;
       }
       const groupId = randomId(8);
       const data = JSON.stringify(value);
@@ -338,9 +419,42 @@ var P2PKIT_IIFE = (function (exports) {
         await state.queue.send(packet);
       }
     }
+    /**
+     * Synchronous acceptance for raw mode: queues on `"queue"`-policy channels
+     * (fire-and-forget) and returns whether the payload was accepted; on
+     * `"drop"`-policy channels returns `false` when it was rejected under
+     * backpressure instead of queueing stale lossy state.
+     *
+     * Why this exists beside the async {@link sendOn}: Emscripten `ccall`
+     * exports and other synchronous producers must learn send acceptance in the
+     * same tick; a promise resolves too late to substitute fresh state.
+     */
+    trySendOn(channelIndex, value) {
+      if (!this.raw) throw new Error("trySendOn requires raw mode (options.raw)");
+      const state = this.channelStates[channelIndex];
+      if (!state || state.channel.readyState !== "open") return false;
+      const bytes = toUint8Array(value);
+      if (state.spec?.mode === "drop") return state.queue.trySend(bytes);
+      state.queue.send(bytes).catch((err) => {
+        this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)));
+      });
+      return true;
+    }
+    /**
+     * Last known round-trip time estimate for this link in milliseconds, from
+     * polling `pc.getStats()` while connected; 0 when not connected.
+     *
+     * Why cached instead of exposing `getStats()` directly: synchronous C
+     * exports (Emscripten `ccall`) cannot await a promise, so the transport
+     * keeps a freshest-known value.
+     */
+    getRoundTripTimeMs() {
+      return this.rttMs;
+    }
     disconnect() {
       this.closed = true;
       this.clearConnectTimer();
+      this.stopRttPolling();
       for (const state of this.channelStates) {
         state.queue.detach();
         try {
@@ -357,12 +471,12 @@ var P2PKIT_IIFE = (function (exports) {
     setupChannel(index, channel, options) {
       const chunker = new Chunker({ maxPacketSize: options.chunkSize });
       const queue = new RTCDataChannelSendQueue({
-        highWaterBytes: options.highWaterBytes,
-        lowWaterBytes: options.lowWaterBytes,
+        highWaterBytes: options.channels?.[index]?.highWaterBytes ?? options.highWaterBytes,
+        lowWaterBytes: options.channels?.[index]?.lowWaterBytes ?? options.lowWaterBytes,
         onDrain: () => this.emitter.emit("drain", index)
       });
       queue.attach(channel);
-      this.channelStates[index] = { channel, queue, chunker };
+      this.channelStates[index] = { channel, queue, chunker, spec: this.channelSpecs?.[index] };
       try {
         channel.binaryType = "arraybuffer";
       } catch {
@@ -382,7 +496,39 @@ var P2PKIT_IIFE = (function (exports) {
       if (this.connectEmitted || this.closed) return;
       this.connectEmitted = true;
       this.clearConnectTimer();
+      this.startRttPolling();
       this.emitter.emit("connect");
+    }
+    startRttPolling() {
+      if (this.rttTimer || typeof this.pc.getStats !== "function") return;
+      this.rttTimer = setInterval(() => {
+        if (this.closed) {
+          this.stopRttPolling();
+          return;
+        }
+        this.pc.getStats().then((report) => {
+          if (this.closed || this.rttTimer === void 0) return;
+          let best = 0;
+          report.forEach((entry) => {
+            if (entry.type === "candidate-pair" && entry.state === "succeeded" && typeof entry.currentRoundTripTime === "number") {
+              const ms = entry.currentRoundTripTime * 1e3;
+              if (best === 0 || ms < best) best = ms;
+            }
+          });
+          if (best > 0) this.rttMs = Math.round(best);
+        }).catch(() => {
+        });
+      }, 2e3);
+      if (typeof this.rttTimer === "object" && this.rttTimer && typeof this.rttTimer.unref === "function") {
+        this.rttTimer.unref();
+      }
+    }
+    stopRttPolling() {
+      if (this.rttTimer !== void 0) {
+        clearInterval(this.rttTimer);
+        this.rttTimer = void 0;
+      }
+      this.rttMs = 0;
     }
     clearConnectTimer() {
       if (this.connectTimer !== void 0) {
@@ -394,6 +540,7 @@ var P2PKIT_IIFE = (function (exports) {
       if (this.closed || this.connectEmitted || this.emittedClose) return;
       this.closed = true;
       this.clearConnectTimer();
+      this.stopRttPolling();
       this.emitter.emit("error", new RTCTransportConnectTimeoutError(this.connectTimeoutMs));
       for (const state of this.channelStates) {
         state.queue.detach();
@@ -455,6 +602,12 @@ var P2PKIT_IIFE = (function (exports) {
     onData(channelIndex, data) {
       const state = this.channelStates[channelIndex];
       if (!state) return;
+      if (this.raw) {
+        if (typeof data === "string") return;
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        this.emitter.emit("message", bytes, channelIndex);
+        return;
+      }
       const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
       let packet;
       try {
@@ -473,6 +626,7 @@ var P2PKIT_IIFE = (function (exports) {
       if (this.emittedClose) return;
       this.emittedClose = true;
       this.clearConnectTimer();
+      this.stopRttPolling();
       for (const state of this.channelStates) {
         state.chunker.reset();
         state.queue.detach();

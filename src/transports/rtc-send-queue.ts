@@ -33,6 +33,23 @@ function payloadByteLength(data: SendPayload): number {
 }
 
 /**
+ * Snapshot a payload for queue storage. Strings are immutable and returned
+ * as-is; binary payloads are copied so a caller that reuses or frees its
+ * buffer (e.g. C++ wasm heap memory) the moment send() resolves cannot
+ * corrupt a queued send that flushes later.
+ */
+function snapshotPayload(data: SendPayload): SendPayload {
+  if (typeof data === "string") return data
+  const view =
+    data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  const copy = new Uint8Array(view.byteLength)
+  copy.set(view)
+  return copy
+}
+
+/**
  * Per-channel outgoing send queue with optional high/low water backpressure.
  * Attach to any native {@link RTCDataChannel} (or compatible stub) for ordered,
  * non-dropping sends. Used internally by {@link RTCTransport}; also suitable for
@@ -93,9 +110,44 @@ export class RTCDataChannelSendQueue {
   }
 
   /**
+   * Synchronous, lossy send attempt: returns `false` (dropping the payload)
+   * when the channel is at or above the high-water mark, instead of queueing.
+   *
+   * Why this exists beside the async {@link send}: Emscripten `ccall` exports
+   * (and other synchronous producers of lossy, time-sensitive traffic such as
+   * per-tick game state) must learn acceptance in the same tick — a promise
+   * would answer after the moment to resend has passed. Only meaningful with
+   * {@link highWaterBytes} configured; without it, always sends and returns
+   * true (legacy polling path has no drop policy).
+   *
+   * Never overtakes {@link send}: when older payloads are still queued, this
+   * appends behind them (snapshot included) and reports `true` — the payload
+   * was accepted and will flush in order.
+   */
+  trySend(data: SendPayload): boolean {
+    const channel = this.channel
+    if (!channel || channel.readyState !== "open") return false
+    if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
+      return false
+    }
+    if (this.highWaterBytes !== undefined && this.queue.length > 0) {
+      this.queue.push(snapshotPayload(data))
+      this.tryFlushAfterSend()
+      return true
+    }
+    channel.send(data)
+    if (this.highWaterBytes === undefined) return true
+    if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true
+    else this.tryFlushAfterSend()
+    return true
+  }
+
+  /**
    * Send one payload. With {@link highWaterBytes} configured, payloads are queued
    * (never dropped) while the channel is at or above the high-water mark;
    * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
+   * Queued payloads always flush in FIFO order: while any older payload is
+   * still queued, new payloads append behind it rather than sending directly.
    */
   async send(data: SendPayload): Promise<void> {
     const channel = this.channel
@@ -109,7 +161,16 @@ export class RTCDataChannelSendQueue {
 
     if (channel.bufferedAmount >= this.highWaterBytes) {
       this.backpressured = true
-      this.queue.push(data)
+      this.queue.push(snapshotPayload(data))
+      return
+    }
+
+    // Older payloads are still queued: append behind them instead of sending
+    // directly, so a drained channel (e.g. bufferedAmount fell without a
+    // `bufferedamountlow` event) can never let a new payload overtake them.
+    if (this.queue.length > 0) {
+      this.queue.push(snapshotPayload(data))
+      this.tryFlushAfterSend()
       return
     }
 

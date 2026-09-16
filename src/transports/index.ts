@@ -2,6 +2,7 @@ export type { Transport, TransportEvents } from "./types.js"
 export {
   RTCTransport,
   RTCTransportConnectTimeoutError,
+  RTCTransportBackpressureDropError,
   type RTCTransportOptions,
   type RTCTransportEvents,
   type RTCChannelSpec,

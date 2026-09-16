@@ -13,6 +13,28 @@ export interface RTCChannelSpec {
   label: string
   ordered: boolean
   maxRetransmits?: number
+  /**
+   * Per-channel backpressure policy (raw mode only; default `"queue"`):
+   * - `"queue"`: sends accepted while under the high-water mark queue in order
+   *   and flush on `bufferedamountlow` (never dropped).
+   * - `"drop"`: sends at or above the high-water mark are rejected
+   *   synchronously: {@link RTCTransport.trySendOn} returns `false` and the
+   *   async {@link RTCTransport.sendOn} rejects with
+   *   {@link RTCTransportBackpressureDropError}, so lossy, time-sensitive
+   *   producers can resend fresh state instead of buffering stale state.
+   */
+  mode?: "queue" | "drop"
+  /**
+   * Per-channel override for the queue high-water mark; falls back to
+   * {@link RTCTransportOptions.highWaterBytes} when omitted.
+   */
+  highWaterBytes?: number
+  /**
+   * Per-channel override for `bufferedAmountLowThreshold`; falls back to
+   * {@link RTCTransportOptions.lowWaterBytes} (or half the effective
+   * high-water mark) when omitted.
+   */
+  lowWaterBytes?: number
 }
 
 export interface RTCTransportOptions {
@@ -48,6 +70,23 @@ export interface RTCTransportOptions {
    * Defaults to half of {@link highWaterBytes} when omitted.
    */
   lowWaterBytes?: number
+  /**
+   * Opt-in raw-binary mode (off by default, preserving the JSON paths):
+   * `send`/`sendOn` payloads are binary (`ArrayBuffer` or `ArrayBufferView`)
+   * and cross each data channel byte-for-byte as a single message — no JSON
+   * encoding, no chunking; received messages are delivered to the `message`
+   * handler as a fresh `Uint8Array` view with the channel index. Per-channel
+   * drop/queue policy is controlled by {@link RTCChannelSpec.mode}.
+   */
+  raw?: boolean
+}
+
+/** Coerce a raw-mode payload to bytes; throws on non-binary input. */
+function toUint8Array(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value
+  if (value instanceof ArrayBuffer) return new Uint8Array(value)
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  throw new Error("raw RTC payloads must be an ArrayBuffer or ArrayBufferView")
 }
 
 /** Distinct timeout error emitted when {@link RTCTransportOptions.connectTimeoutMs} elapses. */
@@ -57,6 +96,22 @@ export class RTCTransportConnectTimeoutError extends Error {
 
   constructor(timeoutMs: number) {
     super(`RTC transport connect timed out after ${timeoutMs}ms`)
+  }
+}
+
+/**
+ * Distinct error the async {@link RTCTransport.sendOn} rejects with in raw
+ * mode when a `"drop"`-policy channel rejects the payload under backpressure
+ * (the synchronous counterpart to {@link RTCTransport.trySendOn} returning
+ * `false`). It never rejects for this reason on `"queue"`-policy channels or
+ * in the default JSON mode.
+ */
+export class RTCTransportBackpressureDropError extends Error {
+  override readonly name = "ErrorBackpressureDrop"
+  readonly code = "ERR_RTC_BACKPRESSURE_DROP"
+
+  constructor(channelIndex: number) {
+    super(`RTC channel ${channelIndex} dropped raw payload under backpressure (drop mode)`)
   }
 }
 
@@ -75,6 +130,7 @@ interface ChannelState {
   channel: RTCDataChannel
   queue: RTCDataChannelSendQueue
   chunker: Chunker
+  spec?: RTCChannelSpec
 }
 
 /**
@@ -101,6 +157,9 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   private readonly pendingCandidates: RTCIceCandidateInit[] = []
   private closed = false
   private emittedClose = false
+  private readonly raw: boolean
+  private rttMs = 0
+  private rttTimer?: ReturnType<typeof setInterval>
 
   constructor(options: RTCTransportOptions) {
     this.self = options.self
@@ -109,6 +168,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     this.channelSpecs = options.channels
     this.expectedChannelCount = options.channels?.length ?? 1
     this.connectTimeoutMs = options.connectTimeoutMs
+    this.raw = options.raw === true
 
     const iceServers = options.iceServers ?? DEFAULT_ICE_SERVERS
     this.pc = new options.backend.RTCPeerConnection({ iceServers })
@@ -192,13 +252,31 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   }
 
   async send(value: T): Promise<void> {
-    return this.sendOn(0, value)
+    await this.sendOn(0, value)
   }
 
+  /**
+   * Send one value on the given channel; resolves `undefined` once the payload
+   * has been handed to the send queue (default JSON mode, preserving the
+   * historical `Promise<void>` contract). In raw mode (`raw: true`) binary
+   * payloads cross byte-for-byte: on `"drop"`-policy channels the promise
+   * rejects with {@link RTCTransportBackpressureDropError} when the payload is
+   * rejected under backpressure (use {@link trySendOn} for synchronous
+   * acceptance); on `"queue"`-policy channels it never rejects for that reason.
+   */
   async sendOn(channelIndex: number, value: T): Promise<void> {
     const state = this.channelStates[channelIndex]
     if (!state || state.channel.readyState !== "open") {
       throw new Error("RTC transport is not open")
+    }
+    if (this.raw) {
+      const bytes = toUint8Array(value)
+      if (state.spec?.mode === "drop") {
+        if (!state.queue.trySend(bytes)) throw new RTCTransportBackpressureDropError(channelIndex)
+        return
+      }
+      await state.queue.send(bytes)
+      return
     }
     const groupId = randomId(8)
     const data = JSON.stringify(value)
@@ -207,9 +285,47 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     }
   }
 
+  /**
+   * Synchronous acceptance for raw mode: queues on `"queue"`-policy channels
+   * (fire-and-forget) and returns whether the payload was accepted; on
+   * `"drop"`-policy channels returns `false` when it was rejected under
+   * backpressure instead of queueing stale lossy state.
+   *
+   * Why this exists beside the async {@link sendOn}: Emscripten `ccall`
+   * exports and other synchronous producers must learn send acceptance in the
+   * same tick; a promise resolves too late to substitute fresh state.
+   */
+  trySendOn(channelIndex: number, value: T): boolean {
+    if (!this.raw) throw new Error("trySendOn requires raw mode (options.raw)")
+    const state = this.channelStates[channelIndex]
+    if (!state || state.channel.readyState !== "open") return false
+    const bytes = toUint8Array(value)
+    if (state.spec?.mode === "drop") return state.queue.trySend(bytes)
+    // Accepted for queued delivery; a later native send failure surfaces on
+    // the `error` event instead of an unhandled rejection (the caller cannot
+    // await a synchronous export).
+    state.queue.send(bytes).catch(err => {
+      this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)))
+    })
+    return true
+  }
+
+  /**
+   * Last known round-trip time estimate for this link in milliseconds, from
+   * polling `pc.getStats()` while connected; 0 when not connected.
+   *
+   * Why cached instead of exposing `getStats()` directly: synchronous C
+   * exports (Emscripten `ccall`) cannot await a promise, so the transport
+   * keeps a freshest-known value.
+   */
+  getRoundTripTimeMs(): number {
+    return this.rttMs
+  }
+
   disconnect(): void {
     this.closed = true
     this.clearConnectTimer()
+    this.stopRttPolling()
     for (const state of this.channelStates) {
       state.queue.detach()
       try {
@@ -233,13 +349,13 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   ): void {
     const chunker = new Chunker({ maxPacketSize: options.chunkSize })
     const queue = new RTCDataChannelSendQueue({
-      highWaterBytes: options.highWaterBytes,
-      lowWaterBytes: options.lowWaterBytes,
+      highWaterBytes: options.channels?.[index]?.highWaterBytes ?? options.highWaterBytes,
+      lowWaterBytes: options.channels?.[index]?.lowWaterBytes ?? options.lowWaterBytes,
       onDrain: () => this.emitter.emit("drain", index),
     })
     queue.attach(channel)
 
-    this.channelStates[index] = { channel, queue, chunker }
+    this.channelStates[index] = { channel, queue, chunker, spec: this.channelSpecs?.[index] }
 
     try {
       channel.binaryType = "arraybuffer"
@@ -264,7 +380,51 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (this.connectEmitted || this.closed) return
     this.connectEmitted = true
     this.clearConnectTimer()
+    this.startRttPolling()
     this.emitter.emit("connect")
+  }
+
+  private startRttPolling(): void {
+    if (this.rttTimer || typeof this.pc.getStats !== "function") return
+    this.rttTimer = setInterval(() => {
+      if (this.closed) {
+        this.stopRttPolling()
+        return
+      }
+      this.pc
+        .getStats()
+        .then(report => {
+          // A closure (or a stopRttPolling that already cleared the cached
+          // value) must not be undone by an in-flight getStats resolution.
+          if (this.closed || this.rttTimer === undefined) return
+          let best = 0
+          report.forEach(entry => {
+            if (
+              entry.type === "candidate-pair" &&
+              entry.state === "succeeded" &&
+              typeof entry.currentRoundTripTime === "number"
+            ) {
+              const ms = entry.currentRoundTripTime * 1000
+              if (best === 0 || ms < best) best = ms
+            }
+          })
+          if (best > 0) this.rttMs = Math.round(best)
+        })
+        .catch(() => {
+          /* stats unavailable; keep last value */
+        })
+    }, 2000)
+    if (typeof this.rttTimer === "object" && this.rttTimer && typeof this.rttTimer.unref === "function") {
+      this.rttTimer.unref()
+    }
+  }
+
+  private stopRttPolling(): void {
+    if (this.rttTimer !== undefined) {
+      clearInterval(this.rttTimer)
+      this.rttTimer = undefined
+    }
+    this.rttMs = 0
   }
 
   private clearConnectTimer(): void {
@@ -278,6 +438,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (this.closed || this.connectEmitted || this.emittedClose) return
     this.closed = true
     this.clearConnectTimer()
+    this.stopRttPolling()
     this.emitter.emit("error", new RTCTransportConnectTimeoutError(this.connectTimeoutMs!))
     for (const state of this.channelStates) {
       state.queue.detach()
@@ -348,6 +509,12 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   private onData(channelIndex: number, data: string | ArrayBuffer): void {
     const state = this.channelStates[channelIndex]
     if (!state) return
+    if (this.raw) {
+      if (typeof data === "string") return // raw contract is binary-only
+      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+      this.emitter.emit("message", bytes as T, channelIndex)
+      return
+    }
     const raw = typeof data === "string" ? data : new TextDecoder().decode(data)
     let packet: { id: string; i: number; n: number; part: string }
     try {
@@ -368,6 +535,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (this.emittedClose) return
     this.emittedClose = true
     this.clearConnectTimer()
+    this.stopRttPolling()
     for (const state of this.channelStates) {
       state.chunker.reset()
       state.queue.detach()
