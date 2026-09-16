@@ -212,25 +212,31 @@ export class RTCDataChannelSendQueue {
    * Why this exists beside the async {@link send}: Emscripten `ccall` exports
    * (and other synchronous producers of lossy, time-sensitive traffic such as
    * per-tick game state) must learn acceptance in the same tick — a promise
-   * would answer after the moment to resend has passed. Only meaningful with
-   * {@link highWaterBytes} configured; without it, always sends and returns
-   * true (legacy polling path has no drop policy).
+   * would answer after the moment to resend has passed. Without
+   * {@link highWaterBytes} there is no drop policy: the payload is always
+   * accepted (`true`) — sent directly when the FIFO is empty, or ordered
+   * behind retained work otherwise.
    *
-   * Never overtakes older work: when payloads or jobs are still queued, this
-   * appends behind them (snapshot included) and reports `true` — the payload
-   * was accepted and will flush in order.
+   * Never overtakes older work, and never queues a refusal: the high-water
+   * check comes first — a payload offered while the channel is at/above the
+   * mark is refused with nothing retained (the original queue contract) — and
+   * below the mark, when payloads or jobs are still queued, this appends
+   * behind them (snapshot included) and reports `true`: the payload was
+   * accepted and will flush in order. That single FIFO holds whether or not a
+   * watermark is configured; without one there is no drop policy, so pending
+   * work forces ordering but never refusal.
    */
   trySend(data: SendPayload): boolean {
     const channel = this.channel
     if (!channel || channel.readyState !== "open") return false
     if (this.failureError !== undefined) return false
-    if (this.highWaterBytes !== undefined && this.entries.length > 0) {
+    if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
+      return false
+    }
+    if (this.entries.length > 0) {
       this.entries.push({ kind: "payload", data: snapshotPayload(data) })
       this.drain()
       return true
-    }
-    if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
-      return false
     }
     channel.send(data)
     if (this.highWaterBytes === undefined) return true
@@ -239,19 +245,31 @@ export class RTCDataChannelSendQueue {
   }
 
   /**
-   * Send one payload. With {@link highWaterBytes} configured, payloads are queued
-   * (never dropped) while the channel is at or above the high-water mark;
-   * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
-   * Queued payloads always flush in FIFO order: while any older work — payload
-   * or job — is still queued, new payloads append behind it rather than sending
-   * directly. The promise resolves on acceptance into the queue (the historical
-   * contract), not on delivery; a later flush failure surfaces through
-   * {@link RTCDataChannelSendQueueOptions.onSendError}.
+   * Send one payload. One FIFO governs this and every other public send entry:
+   * while any older work — payload or job — is still queued, the new payload
+   * appends behind it rather than sending directly, whether or not a watermark
+   * is configured. With {@link highWaterBytes} configured, payloads are also
+   * queued (never dropped) while the channel is at or above the high-water
+   * mark; with no watermark, the legacy direct send plus 1 MB polling flush
+   * applies (same as stock RTCTransport). The promise resolves on acceptance
+   * into the queue (the historical contract), not on delivery; a later flush
+   * failure surfaces through {@link RTCDataChannelSendQueueOptions.onSendError}.
    */
   async send(data: SendPayload): Promise<void> {
     const channel = this.channel
     if (!channel || channel.readyState !== "open") throw new Error("RTC data channel is not open")
     if (this.failureError !== undefined) throw this.failureError
+
+    // Older work is retained (e.g. a job blocked on the fallback threshold):
+    // append behind it so nothing overtakes, watermark or not.
+    if (this.entries.length > 0) {
+      if (this.highWaterBytes !== undefined && channel.bufferedAmount >= this.highWaterBytes) {
+        this.backpressured = true
+      }
+      this.entries.push({ kind: "payload", data: snapshotPayload(data) })
+      this.drain()
+      return
+    }
 
     if (this.highWaterBytes === undefined) {
       channel.send(data)
@@ -259,8 +277,8 @@ export class RTCDataChannelSendQueue {
       return
     }
 
-    if (channel.bufferedAmount >= this.highWaterBytes || this.entries.length > 0) {
-      if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true
+    if (channel.bufferedAmount >= this.highWaterBytes) {
+      this.backpressured = true
       this.entries.push({ kind: "payload", data: snapshotPayload(data) })
       this.drain()
       return
