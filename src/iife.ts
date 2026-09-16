@@ -12,6 +12,9 @@ export { isInitiator, chooseTransport, capsFor, DEFAULT_TRANSPORT_ORDER } from "
 export {
   RTCTransport,
   RTCTransportConnectTimeoutError,
+  directIceServers,
+  validateDirectCandidate,
+  validateDirectDescription,
   type RTCTransportOptions,
   type RTCTransportEvents,
   type RTCChannelSpec,

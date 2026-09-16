@@ -122,8 +122,16 @@ function createP2pkitWasmGlue(config) {
     const connectTimeoutMs = Number.isFinite(config.connectTimeoutMs) ? config.connectTimeoutMs : 15000;
 
     // ---- channel table ------------------------------------------------------
-    // Normalizes the caller's channel table into RTCTransport channel specs:
-    // [{ label, options, mode: 'queued'|'drop', highWaterBytes, lowWaterBytes }].
+    // Normalizes the caller's channel table into per-channel records:
+    // [{ label, ordered, maxRetransmits?, mode: 'queued'|'drop',
+    //    highWaterBytes, lowWaterBytes }].
+    // The glue-facing config keeps its documented names: per-channel options
+    // nested as `options: { ordered, maxRetransmits }` (flattened here onto the
+    // record) and backpressure mode 'queued'|'drop' (mirrored in getStats()).
+    // startTransport() translates these records into RTCTransport's flat
+    // RTCChannelSpec shape — including mode 'queued' -> the core's 'queue' —
+    // so createDataChannel actually receives the requested
+    // ordered/reliability flags.
     // Entries may be partial; anything omitted falls back to the matching
     // default for that array position.
     const defaultChannels = [
@@ -153,10 +161,34 @@ function createP2pkitWasmGlue(config) {
             throw new Error('p2pkit-wasm: duplicate channel label "' + label + '"');
         }
         seenLabels.add(label);
-        const mode = spec.mode === 'queued' || spec.mode === 'drop' ? spec.mode : fallback.mode;
+        const mode =
+            spec.mode === 'queued' ? 'queued' :
+            spec.mode === 'drop' ? 'drop' :
+            fallback.mode === 'drop' ? 'drop' : 'queued';
+        // Channel options are documented nested; entry-level flat fields are
+        // accepted too (they read the same as RTCChannelSpec's own shape).
+        const nested = spec.options || {};
+        const orderedSource =
+            typeof nested.ordered === 'boolean' ? nested.ordered :
+            typeof spec.ordered === 'boolean' ? spec.ordered :
+            fallback.options.ordered;
+        const retransmitsSource =
+            nested.maxRetransmits !== undefined ? nested.maxRetransmits :
+            spec.maxRetransmits !== undefined ? spec.maxRetransmits :
+            fallback.options.maxRetransmits;
+        if (typeof orderedSource !== 'boolean') {
+            throw new Error('p2pkit-wasm: channel "' + label + '" requires options.ordered to be a boolean');
+        }
+        if (
+            retransmitsSource !== undefined &&
+            !(typeof retransmitsSource === 'number' && Number.isSafeInteger(retransmitsSource) && retransmitsSource >= 0)
+        ) {
+            throw new Error('p2pkit-wasm: channel "' + label + '" options.maxRetransmits must be a nonnegative integer');
+        }
         return {
             label: label,
-            options: spec.options || fallback.options,
+            ordered: orderedSource,
+            maxRetransmits: retransmitsSource,
             mode: mode,
             highWaterBytes: Number.isFinite(spec.highWaterBytes) ? spec.highWaterBytes : fallback.highWaterBytes,
             lowWaterBytes: Number.isFinite(spec.lowWaterBytes) ? spec.lowWaterBytes : fallback.lowWaterBytes,
@@ -280,6 +312,18 @@ function createP2pkitWasmGlue(config) {
         }
         const signalling = ensureSignallingChannel();
         const iceServers = config.iceServers || kit.DEFAULT_ICE_SERVERS || [];
+        // Translate the glue-facing channel records into RTCChannelSpec:
+        // flat ordered/maxRetransmits and the core mode type ('queue'|'drop').
+        const coreSpecs = channelSpecs.map(function (spec) {
+            return {
+                label: spec.label,
+                ordered: spec.ordered,
+                maxRetransmits: spec.maxRetransmits,
+                mode: spec.mode === 'queued' ? 'queue' : 'drop',
+                highWaterBytes: spec.highWaterBytes,
+                lowWaterBytes: spec.lowWaterBytes,
+            };
+        });
         transport = new kit.RTCTransport({
             self: selfPeerId,
             remote: remotePeerId,
@@ -287,7 +331,7 @@ function createP2pkitWasmGlue(config) {
             signalling: signalling,
             backend: { RTCPeerConnection: RTCPeerConnection },
             iceServers: iceServers,
-            channels: channelSpecs,
+            channels: coreSpecs,
             raw: true,
             connectTimeoutMs: connectTimeoutMs,
         });
