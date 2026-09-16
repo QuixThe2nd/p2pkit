@@ -210,9 +210,30 @@ var P2PKIT_IIFE = (function (exports) {
 
   // src/transports/rtc-send-queue.ts
   var RTC_SEND_QUEUE_FLUSH_THRESHOLD = 1 << 20;
+  function utf8ByteLength(text) {
+    let bytes = 0;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code < 128) {
+        bytes += 1;
+      } else if (code < 2048) {
+        bytes += 2;
+      } else if (code >= 55296 && code <= 56319) {
+        const low = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+        if (low >= 56320 && low <= 57343) {
+          bytes += 4;
+          i++;
+        } else {
+          bytes += 3;
+        }
+      } else {
+        bytes += 3;
+      }
+    }
+    return bytes;
+  }
   function payloadByteLength(data) {
-    if (typeof data === "string") return data.length;
-    if (data instanceof ArrayBuffer) return data.byteLength;
+    if (typeof data === "string") return utf8ByteLength(data);
     return data.byteLength;
   }
   function snapshotPayload(data) {
@@ -227,15 +248,19 @@ var P2PKIT_IIFE = (function (exports) {
     highWaterBytes;
     lowWaterBytes;
     onDrain;
+    onSendError;
     maxQueuedBytes;
     maxQueuedJobs;
-    queue = [];
-    jobs = [];
+    /** The single authoritative FIFO of retained-but-undelivered work. */
+    entries = [];
+    /** Wire bytes of job payloads still retained (payload entries count via {@link RTCDataChannelSendQueue.bufferedAmount}). */
     queuedBytes = 0;
-    jobTimer;
+    drainTimer;
     lowHandler;
     flushing = false;
     backpressured = false;
+    /** Set once a native send throws mid-drain; further sends reject until re-attach. */
+    failureError;
     constructor(options = {}) {
       this.highWaterBytes = options.highWaterBytes;
       if (options.highWaterBytes !== void 0) {
@@ -244,6 +269,7 @@ var P2PKIT_IIFE = (function (exports) {
         this.lowWaterBytes = options.lowWaterBytes;
       }
       this.onDrain = options.onDrain;
+      this.onSendError = options.onSendError;
       this.maxQueuedBytes = options.maxQueuedBytes;
       this.maxQueuedJobs = options.maxQueuedJobs;
     }
@@ -253,7 +279,7 @@ var P2PKIT_IIFE = (function (exports) {
       this.channel = channel;
       if (this.highWaterBytes === void 0) return;
       channel.bufferedAmountLowThreshold = this.lowWaterBytes;
-      this.lowHandler = () => this.flushQueue();
+      this.lowHandler = () => this.drain();
       if (channel.addEventListener) channel.addEventListener("bufferedamountlow", this.lowHandler);
       else channel.onbufferedamountlow = this.lowHandler;
     }
@@ -264,22 +290,26 @@ var P2PKIT_IIFE = (function (exports) {
         if (channel.removeEventListener) channel.removeEventListener("bufferedamountlow", this.lowHandler);
         else channel.onbufferedamountlow = null;
       }
+      this.failEntries(new Error("RTC send queue detached before delivery"));
       this.channel = void 0;
       this.lowHandler = void 0;
-      this.queue.length = 0;
+      this.failureError = void 0;
       this.flushing = false;
       this.backpressured = false;
-      if (this.jobTimer !== void 0) {
-        clearTimeout(this.jobTimer);
-        this.jobTimer = void 0;
-      }
-      this.failJobs(new Error("RTC send queue detached before delivery"));
     }
-    /** Channel `bufferedAmount` plus bytes still waiting in this queue. */
+    /** Channel `bufferedAmount` plus wire bytes still waiting in this queue. */
     get bufferedAmount() {
       let pending = 0;
-      for (const item of this.queue) pending += payloadByteLength(item);
-      return (this.channel?.bufferedAmount ?? 0) + pending + this.queuedBytes;
+      for (const entry of this.entries) {
+        if (entry.kind === "payload") {
+          pending += payloadByteLength(entry.data);
+        } else {
+          for (let i = entry.next; i < entry.payloads.length; i++) {
+            pending += payloadByteLength(entry.payloads[i]);
+          }
+        }
+      }
+      return (this.channel?.bufferedAmount ?? 0) + pending;
     }
     /**
      * Synchronous, lossy send attempt: returns `false` (dropping the payload)
@@ -292,67 +322,61 @@ var P2PKIT_IIFE = (function (exports) {
      * {@link highWaterBytes} configured; without it, always sends and returns
      * true (legacy polling path has no drop policy).
      *
-     * Never overtakes {@link send}: when older payloads are still queued, this
+     * Never overtakes older work: when payloads or jobs are still queued, this
      * appends behind them (snapshot included) and reports `true` — the payload
      * was accepted and will flush in order.
      */
     trySend(data) {
       const channel = this.channel;
       if (!channel || channel.readyState !== "open") return false;
-      if (this.jobs.length > 0) return this.tryJob([data]);
+      if (this.failureError !== void 0) return false;
+      if (this.highWaterBytes !== void 0 && this.entries.length > 0) {
+        this.entries.push({ kind: "payload", data: snapshotPayload(data) });
+        this.drain();
+        return true;
+      }
       if (this.highWaterBytes !== void 0 && channel.bufferedAmount >= this.highWaterBytes) {
         return false;
-      }
-      if (this.highWaterBytes !== void 0 && this.queue.length > 0) {
-        this.queue.push(snapshotPayload(data));
-        this.tryFlushAfterSend();
-        return true;
       }
       channel.send(data);
       if (this.highWaterBytes === void 0) return true;
       if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
-      else this.tryFlushAfterSend();
       return true;
     }
     /**
      * Send one payload. With {@link highWaterBytes} configured, payloads are queued
      * (never dropped) while the channel is at or above the high-water mark;
      * otherwise uses the legacy 1 MB polling flush (same as stock RTCTransport).
-     * Queued payloads always flush in FIFO order: while any older payload is
-     * still queued, new payloads append behind it rather than sending directly.
+     * Queued payloads always flush in FIFO order: while any older work — payload
+     * or job — is still queued, new payloads append behind it rather than sending
+     * directly. The promise resolves on acceptance into the queue (the historical
+     * contract), not on delivery; a later flush failure surfaces through
+     * {@link RTCDataChannelSendQueueOptions.onSendError}.
      */
     async send(data) {
       const channel = this.channel;
       if (!channel || channel.readyState !== "open") throw new Error("RTC data channel is not open");
-      if (this.jobs.length > 0) {
-        await this.sendJob([data]);
-        return;
-      }
+      if (this.failureError !== void 0) throw this.failureError;
       if (this.highWaterBytes === void 0) {
         channel.send(data);
         await this.pollFlush(channel);
         return;
       }
-      if (channel.bufferedAmount >= this.highWaterBytes) {
-        this.backpressured = true;
-        this.queue.push(snapshotPayload(data));
-        return;
-      }
-      if (this.queue.length > 0) {
-        this.queue.push(snapshotPayload(data));
-        this.tryFlushAfterSend();
+      if (channel.bufferedAmount >= this.highWaterBytes || this.entries.length > 0) {
+        if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
+        this.entries.push({ kind: "payload", data: snapshotPayload(data) });
+        this.drain();
         return;
       }
       channel.send(data);
       if (channel.bufferedAmount >= this.highWaterBytes) this.backpressured = true;
-      else this.tryFlushAfterSend();
     }
     /**
      * Opt-in job API for bounded, lossless consumers (direct-mode
      * {@link RTCTransport} in `src/transports/rtc.ts`): submit a burst of payloads
      * as ONE first-in-first-out unit — every payload of a job is handed to
-     * `channel.send()` in order, and no later job's payload is sent before an
-     * earlier job has fully drained, so whole messages keep their order on the
+     * `channel.send()` in order, and no later entry's payload is sent before an
+     * earlier one has fully drained, so whole messages keep their order on the
      * wire. The promise resolves only after the last payload was actually handed
      * to the channel (not merely accepted while backpressured), and rejects —
      * without sending anything further — when the job would exceed
@@ -360,8 +384,8 @@ var P2PKIT_IIFE = (function (exports) {
      * or becomes unusable, or when the queue detaches first ({@link detach}).
      *
      * While the channel sits above the high-water mark, delivery retries on a
-     * short poll timer (bounded: the timer only lives while jobs are pending), so
-     * progress does not depend solely on `bufferedamountlow` firing.
+     * short poll timer (bounded: the timer only lives while work is retained),
+     * so progress does not depend solely on `bufferedamountlow` firing.
      */
     sendJob(payloads) {
       return new Promise((resolve, reject) => {
@@ -373,7 +397,9 @@ var P2PKIT_IIFE = (function (exports) {
      * FIFO): returns whether the job was accepted by this bounded queue — never a
      * promise masquerading as success. Settlement is silent: delivery completes
      * unnoticed and rejection surfaces nowhere, matching producers that cannot
-     * await (e.g. Emscripten `ccall` bridges).
+     * await (e.g. Emscripten `ccall` bridges) — a native send failure during the
+     * drain is reported once through {@link RTCDataChannelSendQueueOptions.onSendError}
+     * instead of throwing here.
      */
     tryJob(payloads) {
       return this.enqueueJob(
@@ -390,77 +416,150 @@ var P2PKIT_IIFE = (function (exports) {
         reject(new Error("RTC data channel is not open"));
         return false;
       }
+      if (this.failureError !== void 0) {
+        reject(this.failureError);
+        return false;
+      }
       if (payloads.length === 0) {
         resolve();
         return true;
       }
-      const snapshot = payloads.map(snapshotPayload);
-      const bytes = snapshot.reduce((total, item) => total + payloadByteLength(item), 0);
-      if (this.maxQueuedBytes !== void 0 && this.queuedBytes + bytes > this.maxQueuedBytes || this.maxQueuedJobs !== void 0 && this.jobs.length >= this.maxQueuedJobs) {
+      const bytes = payloads.reduce((total, item) => total + payloadByteLength(item), 0);
+      if (this.overRetentionLimit(bytes)) {
         reject(new Error("RTC send queue retention limit exceeded"));
         return false;
       }
-      this.jobs.push({ payloads: snapshot, bytes, next: 0, resolve, reject });
+      this.entries.push({
+        kind: "job",
+        payloads: payloads.map(snapshotPayload),
+        bytes,
+        next: 0,
+        resolve,
+        reject
+      });
       this.queuedBytes += bytes;
-      this.drainJobs();
+      this.drain();
       return true;
     }
-    drainJobs() {
-      if (this.jobTimer !== void 0) {
-        clearTimeout(this.jobTimer);
-        this.jobTimer = void 0;
+    overRetentionLimit(bytes) {
+      if (this.maxQueuedBytes !== void 0 && this.queuedBytes + bytes > this.maxQueuedBytes) {
+        return true;
       }
-      while (this.jobs.length > 0) {
-        const channel = this.channel;
-        if (!channel || channel.readyState !== "open") {
-          this.failJobs(new Error("RTC data channel is not open"));
-          return;
+      if (this.maxQueuedJobs !== void 0) {
+        let jobs = 0;
+        for (const entry of this.entries) {
+          if (entry.kind === "job") jobs++;
         }
-        const limit = this.highWaterBytes ?? RTC_SEND_QUEUE_FLUSH_THRESHOLD;
-        const job = this.jobs[0];
-        while (job.next < job.payloads.length) {
-          if (channel.bufferedAmount > limit) {
-            this.jobTimer = setTimeout(() => this.drainJobs(), 10);
-            if (typeof this.jobTimer === "object" && this.jobTimer && typeof this.jobTimer.unref === "function") {
-              this.jobTimer.unref();
-            }
+        if (jobs >= this.maxQueuedJobs) return true;
+      }
+      return false;
+    }
+    /**
+     * The single owner of retained-work delivery: walks the FIFO head-first,
+     * handing payloads to the channel while it stays under the applicable water
+     * mark. Payload entries keep the raw flush contract (send only strictly below
+     * the high-water mark); job entries keep the job contract (send down to the
+     * mark, including the legacy 1 MB threshold when no high-water mark is
+     * configured). While blocked, a short poll timer keeps progress independent
+     * of `bufferedamountlow` events. Any native `channel.send()` throw is
+     * contained here — see {@link handleSendFailure}.
+     */
+    drain() {
+      if (this.flushing) return;
+      this.flushing = true;
+      try {
+        this.cancelDrainTimer();
+        while (this.entries.length > 0) {
+          const channel = this.channel;
+          if (!channel || channel.readyState !== "open") {
+            this.failEntries(new Error("RTC data channel is not open"));
             return;
           }
-          channel.send(job.payloads[job.next++]);
+          const entry = this.entries[0];
+          if (entry.kind === "payload") {
+            const high = this.highWaterBytes;
+            if (high !== void 0 && channel.bufferedAmount >= high) {
+              this.backpressured = true;
+              this.scheduleDrainTimer();
+              return;
+            }
+            channel.send(entry.data);
+            this.entries.shift();
+          } else {
+            const limit = this.highWaterBytes ?? RTC_SEND_QUEUE_FLUSH_THRESHOLD;
+            if (channel.bufferedAmount > limit) {
+              this.scheduleDrainTimer();
+              return;
+            }
+            const payload = entry.payloads[entry.next];
+            channel.send(payload);
+            entry.next++;
+            this.queuedBytes -= payloadByteLength(payload);
+            if (entry.next >= entry.payloads.length) {
+              this.entries.shift();
+              entry.resolve();
+            }
+          }
         }
-        this.jobs.shift();
-        this.queuedBytes -= job.bytes;
-        job.resolve();
+      } catch (error) {
+        this.handleSendFailure(error);
+        return;
+      } finally {
+        this.flushing = false;
+      }
+      if (this.backpressured) {
+        this.backpressured = false;
+        this.onDrain?.();
       }
     }
-    failJobs(error) {
-      if (this.jobs.length === 0) return;
+    /**
+     * Contain a native `channel.send()` throw from the drain — whether it happened
+     * inside a timer callback, a low-water flush, or synchronously under
+     * {@link tryJob}/{@link trySend}: reject every pending job (a partially-sent
+     * job rejects — accepted is not delivered), release all retained payloads,
+     * zero the byte budget, stop the poll timer, and surface the failure exactly
+     * once through {@link RTCDataChannelSendQueueOptions.onSendError} so the
+     * owning transport's error/disconnect path runs even for synchronous
+     * producers. The queue refuses further work until re-attached.
+     */
+    handleSendFailure(cause) {
+      this.cancelDrainTimer();
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      this.failureError = error;
       this.queuedBytes = 0;
-      for (const job of this.jobs.splice(0)) job.reject(error);
+      this.backpressured = false;
+      for (const entry of this.entries.splice(0)) {
+        if (entry.kind === "job") entry.reject(error);
+      }
+      this.onSendError?.(error);
+    }
+    /** Reject all retained jobs (channel gone or queue detached) and drop payloads. */
+    failEntries(error) {
+      this.cancelDrainTimer();
+      this.queuedBytes = 0;
+      for (const entry of this.entries.splice(0)) {
+        if (entry.kind === "job") entry.reject(error);
+      }
     }
     async pollFlush(channel) {
       while (channel.readyState === "open" && channel.bufferedAmount > RTC_SEND_QUEUE_FLUSH_THRESHOLD) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
-    tryFlushAfterSend() {
-      if (!this.channel || this.highWaterBytes === void 0) return;
-      if (this.channel.bufferedAmount < this.highWaterBytes) this.flushQueue();
+    scheduleDrainTimer() {
+      if (this.drainTimer !== void 0) return;
+      this.drainTimer = setTimeout(() => {
+        this.drainTimer = void 0;
+        this.drain();
+      }, 10);
+      if (typeof this.drainTimer === "object" && this.drainTimer && typeof this.drainTimer.unref === "function") {
+        this.drainTimer.unref();
+      }
     }
-    flushQueue() {
-      if (this.flushing || !this.channel || this.highWaterBytes === void 0) return;
-      this.flushing = true;
-      try {
-        const channel = this.channel;
-        while (this.queue.length > 0 && channel.readyState === "open" && channel.bufferedAmount < this.highWaterBytes) {
-          channel.send(this.queue.shift());
-        }
-        if (this.queue.length === 0 && this.backpressured) {
-          this.backpressured = false;
-          this.onDrain?.();
-        }
-      } finally {
-        this.flushing = false;
+    cancelDrainTimer() {
+      if (this.drainTimer !== void 0) {
+        clearTimeout(this.drainTimer);
+        this.drainTimer = void 0;
       }
     }
   };
@@ -800,12 +899,13 @@ var P2PKIT_IIFE = (function (exports) {
     /**
      * Direct-mode fail-closed path: emit the cause once, then tear the link down
      * (`disconnect` emits the single `disconnect`; pending send jobs are rejected
-     * by their queue detaching).
+     * by their queue detaching). Accepts the finished `Error` directly so a
+     * native send failure reaches consumers unaltered.
      */
-    failClosed(message) {
+    failClosed(cause) {
       if (this.closed || this.emittedClose) return;
       try {
-        this.emitter.emit("error", new Error(message));
+        this.emitter.emit("error", cause instanceof Error ? cause : new Error(cause));
       } finally {
         this.disconnect();
       }
@@ -830,6 +930,15 @@ var P2PKIT_IIFE = (function (exports) {
         highWaterBytes: options.channels?.[index]?.highWaterBytes ?? options.highWaterBytes ?? (this.direct ? DIRECT_MAX_BUFFERED : void 0),
         lowWaterBytes: options.channels?.[index]?.lowWaterBytes ?? options.lowWaterBytes,
         onDrain: () => this.emitter.emit("drain", index),
+        // A native send() throw while flushing retained work (including delayed,
+        // timer-driven drains) already rejected every pending job in the queue;
+        // surface it exactly once on the transport's error path. Direct mode
+        // fails the whole link (lockstep JSON cannot continue past a lost
+        // fragment); other modes report the error without tearing the transport.
+        onSendError: (error) => {
+          if (this.direct) this.failClosed(error);
+          else this.emitter.emit("error", error);
+        },
         maxQueuedBytes: this.direct ? DIRECT_MAX_OUTGOING_BYTES : void 0,
         maxQueuedJobs: this.direct ? DIRECT_MAX_OUTGOING_MESSAGES : void 0
       });

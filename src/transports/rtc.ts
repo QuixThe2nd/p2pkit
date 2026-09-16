@@ -579,12 +579,13 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   /**
    * Direct-mode fail-closed path: emit the cause once, then tear the link down
    * (`disconnect` emits the single `disconnect`; pending send jobs are rejected
-   * by their queue detaching).
+   * by their queue detaching). Accepts the finished `Error` directly so a
+   * native send failure reaches consumers unaltered.
    */
-  private failClosed(message: string): void {
+  private failClosed(cause: Error | string): void {
     if (this.closed || this.emittedClose) return
     try {
-      this.emitter.emit("error", new Error(message))
+      this.emitter.emit("error", cause instanceof Error ? cause : new Error(cause))
     } finally {
       this.disconnect()
     }
@@ -627,6 +628,15 @@ export class RTCTransport<T = unknown> implements Transport<T> {
         (this.direct ? DIRECT_MAX_BUFFERED : undefined),
       lowWaterBytes: options.channels?.[index]?.lowWaterBytes ?? options.lowWaterBytes,
       onDrain: () => this.emitter.emit("drain", index),
+      // A native send() throw while flushing retained work (including delayed,
+      // timer-driven drains) already rejected every pending job in the queue;
+      // surface it exactly once on the transport's error path. Direct mode
+      // fails the whole link (lockstep JSON cannot continue past a lost
+      // fragment); other modes report the error without tearing the transport.
+      onSendError: error => {
+        if (this.direct) this.failClosed(error)
+        else this.emitter.emit("error", error)
+      },
       maxQueuedBytes: this.direct ? DIRECT_MAX_OUTGOING_BYTES : undefined,
       maxQueuedJobs: this.direct ? DIRECT_MAX_OUTGOING_MESSAGES : undefined,
     })
