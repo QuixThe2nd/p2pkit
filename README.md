@@ -23,16 +23,17 @@ npm install p2pkit
 
 | Import path | Exports |
 |---|---|
-| `p2pkit` | `P2PKit`, `Peer` |
+| `p2pkit` | `P2PKit`, `Peer`, `Topic`, plus the RTC transport basics (`RTCTransport`, `RTCDataChannelSendQueue`) |
 | `p2pkit/rpc` | `defineAPI`, `defineProtocol`, `RPCError` |
 | `p2pkit/discovery` | `Discovery`, `GossipDiscovery`, `DHTDiscovery` |
 | `p2pkit/auth` | `Signer`, `ECDSASigner`, `NoopSigner`, `KeyManager` |
-| `p2pkit/transports` | `Transport`, `RTCTransport`, `UTPTransport`, `HTTPTransport`, `DHTTransport` |
-| `p2pkit/signalling` | `SignallingChannel`, `WebSocketSignalling` |
+| `p2pkit/transports` | `Transport`, `RTCTransport`, `UTPTransport`, `HTTPTransport`, `DHTTransport`, `chooseTransport`, `RTCDataChannelSendQueue` |
+| `p2pkit/signalling` | `SignallingChannel`, `WebSocketSignalling`, lobby wire types |
 | `p2pkit/nat` | `mapPort` |
 | `p2pkit/backends` | `getRTC` |
 | `p2pkit/framing` | `Chunker` |
 | `p2pkit/utils` | `extractIP`, `DEFAULT_ICE_SERVERS`, `promiseWithTimeout`, `ErrorTimeout` |
+| `p2pkit/iife` | browser-safe subset: `RTCTransport`, `RTCDataChannelSendQueue`, `chooseTransport`, `SignallingChannel` |
 
 Everything is exposed through the `P2PKit` class; the sub-modules are there when you want a piece on its own.
 
@@ -312,8 +313,8 @@ Every default is swappable, implement the interface and pass it in.
 ```ts
 type SignallingMessage =
   | { announce: true; from: PeerId }
-  | { description: RTCSessionDescription; from: PeerId; to: PeerId } // offer & answer
-  | { iceCandidate: RTCIceCandidate; from: PeerId; to: PeerId }
+  | { description: RTCSessionDescriptionInit; from: PeerId; to: PeerId } // offer & answer
+  | { iceCandidate: RTCIceCandidateInit; from: PeerId; to: PeerId }
 
 interface SignallingChannel {
   send(message: SignallingMessage): void
