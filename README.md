@@ -396,11 +396,70 @@ DEFAULT_ICE_SERVERS: RTCIceServer[] // Google + public STUN fallbacks
 promiseWithTimeout<T>(p: Promise<T>, ms: number): Promise<T | ErrorTimeout>
 ```
 
-## 13. Bootstrapping server
+## 13. RTC data-channel tuning (`p2pkit/transports`)
 
-`bootstrapping-server/` contains a minimal find/pair/relay WebSocket server for two-peer games: clients send `{"t":"find"}`, the server FIFO-pairs them (first waiter = host), then relays opaque `{"t":"sig"}` payloads verbatim between the pair until disconnect (`peer_left`). It is written in TypeScript and shares its lobby wire types with the client library (`src/signalling/lobby.ts`, exported as `p2pkit/signalling`). Build it with `npm install && npm run build` in `bootstrapping-server/`, then run `node bootstrapping-server/dist/server.js`. See its README.
+`RTCTransport` accepts options beyond the defaults `Peer` wires up:
 
-## 14. Emscripten SDK (optional, C++)
+```ts
+import { RTCTransport, type RTCChannelSpec } from "p2pkit/transports"
+
+const transport = new RTCTransport({
+  self, remote, signalling, backend, initiator,
+  // Multi-channel: the initiator opens one channel per spec, the receiver
+  // binds incoming channels by label; `connect` fires once ALL are open.
+  channels: [
+    { label: "state", ordered: true, maxRetransmits: 0, mode: "drop" }, // lossy, fresh state wins
+    { label: "files", ordered: true },                                  // default "queue" policy
+  ] satisfies RTCChannelSpec[],
+  connectTimeoutMs: 15_000, // else RTCTransportConnectTimeoutError + disconnect
+  highWaterBytes: 512 * 1024, // queue sends above the mark instead of polling at 1 MB
+})
+```
+
+- **Multi-channel** (`channels`): one data channel per traffic class, each with its own ordering/reliability and backpressure policy.
+- **Connection deadline** (`connectTimeoutMs`): a link that hasn't connected in time emits `RTCTransportConnectTimeoutError`, closes, and emits `disconnect`.
+- **Backpressure** (`highWaterBytes`/`lowWaterBytes`): sends accepted under the high-water mark queue in a bounded FIFO and flush on `bufferedamountlow`. A channel with `mode: "drop"` rejects sends at the mark instead — `trySendOn` returns `false`, `sendOn` rejects with `RTCTransportBackpressureDropError` — so lossy, time-sensitive producers resend fresh state rather than buffer stale state. The underlying `RTCDataChannelSendQueue` is exported for direct use.
+
+## 14. Direct mode (browser-to-browser, no relay)
+
+`direct: true` opts an `RTCTransport` into strict, bounded, fail-closed operation for a direct link between two browsers with no TURN relay in the path:
+
+```ts
+import { RTCTransport, directIceServers } from "p2pkit/transports"
+
+const transport = new RTCTransport({
+  self, remote, signalling, backend, initiator,
+  direct: true,
+  iceServers: directIceServers(iceServers), // STUN only; TURN/credentials rejected
+})
+```
+
+Direct mode speaks bounded strict JSON over a single ordered/reliable channel: `iceServers` is normalized through `directIceServers` (STUN only, no credentials), outgoing candidates/descriptions are validated (`validateDirectCandidate`, `validateDirectDescription`), inbound signalling and receive floods are bounded and close the link instead of accumulating, framing uses the hardened `Chunker` (`CHUNK_LIMITS` from `p2pkit/framing`), and sends go through the queue's bounded job API — `trySend` gives synchronous acceptance. Incompatible with `channels` and `raw`. The bootstrapping server (§16) pairs exactly two such peers.
+
+## 15. Browser `<script>` bundle (`dist/p2pkit.iife.js`)
+
+No bundler? The build also emits `dist/p2pkit.iife.js`, a self-contained IIFE exposing `globalThis.P2PKIT_IIFE`:
+
+```html
+<script src="node_modules/p2pkit/dist/p2pkit.iife.js"></script>
+<script>
+  const { RTCTransport, RTCDataChannelSendQueue, chooseTransport } = P2PKIT_IIFE
+</script>
+```
+
+The same browser-safe subset — no Node-only paths such as `WebSocketSignalling`'s `ws` fallback or the µTP/DHT/HTTP transports — is importable as the `p2pkit/iife` subpath for bundlers.
+
+## 16. Bootstrapping server
+
+`bootstrapping-server/` contains a minimal find/pair/relay WebSocket server for two-peer games: clients send `{"t":"find"}`, the server FIFO-pairs them (first waiter = host), then relays opaque `{"t":"sig"}` payloads verbatim between the pair until disconnect (`peer_left`). It is written in TypeScript and shares its lobby wire types with the client library (`src/signalling/lobby.ts`, exported as `p2pkit/signalling`), so server and clients compile against a single definition of the wire format:
+
+```ts
+import type { LobbyClientMessage, LobbyServerMessage } from "p2pkit/signalling"
+```
+
+Build it with `npm install && npm run build` in `bootstrapping-server/`, then run `node bootstrapping-server/dist/server.js`. See its README.
+
+## 17. Emscripten SDK (optional, C++)
 
 `emscripten/` contains an optional C++/Emscripten SDK for browser games: packet
 headers (`include/p2pkit-wasm/`), a `WebRtcTransport` C event-pump wrapper, and
