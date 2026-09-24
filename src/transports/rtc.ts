@@ -57,7 +57,9 @@ export interface RTCTransportOptions {
   channels?: RTCChannelSpec[]
   /**
    * Milliseconds from construction until `connect` must fire; otherwise emits
-   * {@link RTCTransportConnectTimeoutError}, closes the link, and emits `disconnect`.
+   * {@link RTCTransportConnectTimeoutError}, closes the link, and emits
+   * `disconnect`. Defaults to {@link DEFAULT_CONNECT_TIMEOUT_MS} so a slot
+   * stuck pre-connect is always bounded; an explicit `0` disables the timer.
    */
   connectTimeoutMs?: number
   /**
@@ -105,6 +107,14 @@ export interface RTCTransportOptions {
    */
   direct?: boolean
 }
+
+/**
+ * Handshake deadline applied when {@link RTCTransportOptions.connectTimeoutMs}
+ * is omitted: a slot stuck pre-connect (ICE may never reach
+ * failed/closed/disconnected if no candidates flow) must not linger forever.
+ * An explicit `connectTimeoutMs: 0` opts out.
+ */
+const DEFAULT_CONNECT_TIMEOUT_MS = 30_000
 
 /**
  * Direct-play resource bounds (used when {@link RTCTransportOptions.direct} is
@@ -305,7 +315,10 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     this.signalling = options.signalling
     this.channelSpecs = options.channels
     this.expectedChannelCount = options.channels?.length ?? 1
-    this.connectTimeoutMs = options.connectTimeoutMs
+    // Bound the slot even when no deadline was configured; an explicit 0
+    // keeps the escape hatch (no connect timer at all).
+    const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+    this.connectTimeoutMs = connectTimeoutMs > 0 ? connectTimeoutMs : undefined
     this.raw = options.raw === true
     this.direct = options.direct === true
     this.initiator = options.initiator
@@ -797,7 +810,19 @@ export class RTCTransport<T = unknown> implements Transport<T> {
         })
       return
     }
-    void this.handleSignal(message)
+    // Serialize inbound signalling and fail the link on a signal the current
+    // session cannot apply (e.g. setRemoteDescription rejecting a stale or
+    // colliding description from a rejoining peer): the slot frees through the
+    // error → disconnect chain instead of dying as an unhandled rejection and
+    // lingering. A renegotiation offer on a live session still applies — only
+    // a description the peer connection rejects lands in the catch.
+    this.signalChain = this.signalChain
+      .then(() => this.handleSignal(message))
+      .catch(err => {
+        if (!this.closed && !this.emittedClose) {
+          this.failClosed(err instanceof Error ? err : new Error("Invalid connection details"))
+        }
+      })
   }
 
   private async handleSignal(message: SignallingMessage): Promise<void> {

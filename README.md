@@ -411,13 +411,13 @@ const transport = new RTCTransport({
     { label: "state", ordered: true, maxRetransmits: 0, mode: "drop" }, // lossy, fresh state wins
     { label: "files", ordered: true },                                  // default "queue" policy
   ] satisfies RTCChannelSpec[],
-  connectTimeoutMs: 15_000, // else RTCTransportConnectTimeoutError + disconnect
+  connectTimeoutMs: 15_000, // default 30_000; 0 disables; else RTCTransportConnectTimeoutError + disconnect
   highWaterBytes: 512 * 1024, // queue sends above the mark instead of polling at 1 MB
 })
 ```
 
 - **Multi-channel** (`channels`): one data channel per traffic class, each with its own ordering/reliability and backpressure policy.
-- **Connection deadline** (`connectTimeoutMs`): a link that hasn't connected in time emits `RTCTransportConnectTimeoutError`, closes, and emits `disconnect`.
+- **Connection deadline** (`connectTimeoutMs`, default `30_000`): a link that hasn't connected in time emits `RTCTransportConnectTimeoutError`, closes, and emits `disconnect`, freeing the peer slot for a rejoin. The default applies even when the option is omitted, so a half-open handshake can never linger; pass `0` explicitly to disable the deadline.
 - **Backpressure** (`highWaterBytes`/`lowWaterBytes`): sends accepted under the high-water mark queue in a bounded FIFO and flush on `bufferedamountlow`. A channel with `mode: "drop"` rejects sends at the mark instead — `trySendOn` returns `false`, `sendOn` rejects with `RTCTransportBackpressureDropError` — so lossy, time-sensitive producers resend fresh state rather than buffer stale state. The underlying `RTCDataChannelSendQueue` is exported for direct use.
 
 ## 14. Direct mode (browser-to-browser, no relay)
