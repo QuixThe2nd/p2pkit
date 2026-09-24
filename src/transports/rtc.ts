@@ -394,9 +394,15 @@ export class RTCTransport<T = unknown> implements Transport<T> {
           options,
         )
       }
-      void (this.direct
-        ? this.negotiate().catch(() => this.failClosed("Direct connection negotiation failed"))
-        : this.negotiate())
+      // A rejection here (offer creation failing, or the PC closing before
+      // setLocalDescription settles — e.g. the app drops a fresh initiator
+      // transport) must free the slot through the disconnect chain, not die
+      // as an unhandled rejection. failClosed no-ops once already closed.
+      void this.negotiate().catch(() =>
+        this.failClosed(
+          this.direct ? "Direct connection negotiation failed" : "Connection negotiation failed",
+        ),
+      )
     } else {
       this.pc.ondatachannel = ev => {
         const label = ev.channel.label

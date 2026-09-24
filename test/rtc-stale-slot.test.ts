@@ -110,14 +110,26 @@ describe("RTCTransport stale-slot rejoin handling", () => {
       disconnected = true
     })
 
-    await vi.advanceTimersByTimeAsync(120_000)
-    expect(errors).toEqual([])
-    expect(disconnected).toBe(false)
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on("unhandledRejection", onUnhandled)
+    try {
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(errors).toEqual([])
+      expect(disconnected).toBe(false)
 
-    // The link is still alive and teardown stays manual (the escape hatch).
-    transport.disconnect()
-    expect(disconnected).toBe(true)
-    expect(errors).toEqual([])
+      // The link is still alive and teardown stays manual (the escape hatch).
+      transport.disconnect()
+      expect(disconnected).toBe(true)
+      expect(errors).toEqual([])
+
+      // Settling any in-flight negotiation: tearing a fresh initiator
+      // transport down must not surface an unhandled rejection either.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
   }, 10_000)
 
   it("fails the link when an inbound description cannot be applied — no unhandled rejection", async () => {
