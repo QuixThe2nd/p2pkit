@@ -580,6 +580,7 @@ var P2PKIT_IIFE = (function (exports) {
   };
 
   // src/transports/rtc.ts
+  var DEFAULT_CONNECT_TIMEOUT_MS = 3e4;
   var DIRECT_MAX_BUFFERED = 1 << 20;
   var DIRECT_MAX_OUTGOING_BYTES = 4 << 20;
   var DIRECT_MAX_OUTGOING_MESSAGES = 128;
@@ -682,7 +683,8 @@ var P2PKIT_IIFE = (function (exports) {
       this.signalling = options.signalling;
       this.channelSpecs = options.channels;
       this.expectedChannelCount = options.channels?.length ?? 1;
-      this.connectTimeoutMs = options.connectTimeoutMs;
+      const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+      this.connectTimeoutMs = connectTimeoutMs > 0 ? connectTimeoutMs : void 0;
       this.raw = options.raw === true;
       this.direct = options.direct === true;
       this.initiator = options.initiator;
@@ -748,7 +750,11 @@ var P2PKIT_IIFE = (function (exports) {
             options
           );
         }
-        void (this.direct ? this.negotiate().catch(() => this.failClosed("Direct connection negotiation failed")) : this.negotiate());
+        void this.negotiate().catch(
+          () => this.failClosed(
+            this.direct ? "Direct connection negotiation failed" : "Connection negotiation failed"
+          )
+        );
       } else {
         this.pc.ondatachannel = (ev) => {
           const label = ev.channel.label;
@@ -1078,7 +1084,11 @@ var P2PKIT_IIFE = (function (exports) {
         });
         return;
       }
-      void this.handleSignal(message);
+      this.signalChain = this.signalChain.then(() => this.handleSignal(message)).catch((err) => {
+        if (!this.closed && !this.emittedClose) {
+          this.failClosed(err instanceof Error ? err : new Error("Invalid connection details"));
+        }
+      });
     };
     async handleSignal(message) {
       if (this.closed) return;
