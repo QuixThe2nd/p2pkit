@@ -28,7 +28,7 @@ npm install p2pkit
 | `p2pkit/discovery` | `Discovery`, `GossipDiscovery`, `DHTDiscovery` |
 | `p2pkit/auth` | `Signer`, `ECDSASigner`, `NoopSigner`, `KeyManager` |
 | `p2pkit/transports` | `Transport`, `RTCTransport`, `UTPTransport`, `HTTPTransport`, `DHTTransport`, `chooseTransport`, `RTCDataChannelSendQueue` |
-| `p2pkit/signalling` | `SignallingChannel`, `WebSocketSignalling`, lobby wire types |
+| `p2pkit/signalling` | `SignallingChannel`, `WebSocketSignalling`, `SignalBroker`, lobby wire types |
 | `p2pkit/nat` | `mapPort` |
 | `p2pkit/backends` | `getRTC` |
 | `p2pkit/framing` | `Chunker` |
@@ -49,7 +49,7 @@ import { WebSocketSignalling } from "p2pkit/signalling"
 
 const kit = new P2PKit<{ type: "chat"; body: string }>({
   self: "0xabc...", // this peer's id
-  signalling: new WebSocketSignalling("wss://rooms.example/room-1")
+  signalling: new WebSocketSignalling("wss://rooms.example/room-1") // deprecated, see below
 })
 
 kit.on("peer", peer => {
@@ -74,6 +74,17 @@ await kit.start() // join the mesh; peers start connecting
 
 kit.broadcast({ type: "chat", body: "hey all" }) // send to entire mesh network
 ```
+
+**`signalling` is deprecated in favour of `bootstrap`.** Constructing your own `WebSocketSignalling` still works and is unchanged, but `bootstrap` is now the supported way to name a lobby, and it is what lets p2pkit notice the lobby dropping (§4.1):
+
+```ts
+const kit = new P2PKit<{ type: "chat"; body: string }>({
+  self: "0xabc...",
+  bootstrap: { kind: "lobby", url: "wss://rooms.example/room-1" },
+})
+```
+
+A `SignallingChannel` you built yourself — your own server, a pub/sub topic, copy-paste — is still passed as `signalling`; that is what the interface is for (§8). Only the hand-rolled `WebSocketSignalling` construction is superseded.
 
 `kit.broadcast()` floods a message across the mesh - each peer relays it onward, so it reaches peers you aren't directly connected to. This matters when full connectivity is impossible: large networks, or two peers both behind firewalls that can each reach a shared relay but not each other. To stop a flood from storming, every message carries a TTL and id, and peers drop anything past the hop limit or already seen within a dedup window; tune both with `broadcast: { ttl, dedupWindow }`. Cap direct connections with `maxPeers`; relaying reaches other nodes only while a connected path exists. The cap does not guarantee mesh connectivity.
 
@@ -219,6 +230,26 @@ const kit = new P2PKit({ self, signalling, discovery: [dhtDiscovery, new GossipD
 ```
 
 The DHT transport (§6) and DHT discovery run on **one shared DHT node** - set `bootstrapHash`/`port` in a single place and the other reuses it; you don't configure (or match) them twice.
+
+### 4.1 Peer-brokered signalling (`brokeredSignalling`)
+
+Discovery supplies *who* to reach; the transport decides *how*. When the lobby is gone there is normally no "how" left, so no new link can form. `brokeredSignalling` supplies one: a handshake signal for a peer we are not linked to is wrapped in a `sig-relay` frame and carried over an existing link, and the peer at the far end delivers it to its own transport as if the lobby had sent it.
+
+```ts
+const kit = new P2PKit({
+  bootstrap: { kind: "lobby", url: "wss://rooms.example/room-1" },
+  brokeredSignalling: true, // default false
+  discovery: new GossipDiscovery(),
+})
+```
+
+- **Off by default.** With it off, a dead lobby means no new connections, exactly as before.
+- **The broker is a postman.** The carried envelope is the lobby's `{announce}` / `{description}` / `{iceCandidate}`, unchanged, so SDP and candidates stay direct-only and every check in `RTCTransport` still applies. Identity is still proven by the hello/ack handshake, not by whoever carried the signal.
+- **One hop, no flooding.** A relay is handed to a single connected peer, forwarded only to a peer the forwarder is directly linked to, and never carried past `ttl` 0. Duplicates are dropped by id; a relay whose destination never links is dropped after `brokerOptions.relayTimeoutMs` (default 15000).
+- **Announces cannot be relayed** — they are addressed to a whole room, not to a peer. Once the lobby is down, discovery is what tells you who exists.
+- Gossip alone still cannot bootstrap a first link: something has to be linked before anything can be carried over it. Brokered signalling heals a mesh, it does not create one.
+
+Passing `bootstrap` lets you give a lobby URL without importing `WebSocketSignalling`; `signalling` still works and takes precedence when both are given. `bootstrap` builds the lobby socket, so when it drops mid-session the kit is told and switches to the relay path on its own.
 
 ---
 

@@ -1,4 +1,5 @@
 import type { PeerId } from "../utils/types.js"
+import type { SignallingMessage } from "../signalling/types.js"
 
 /**
  * On-the-wire frame version. Every frame carries `v`; a receiver rejects frames
@@ -119,6 +120,29 @@ export interface ChunkFrame {
   part: string
 }
 
+/**
+ * Peer-brokered signalling (README §4): one {@link SignallingMessage} carried
+ * over an existing link because the lobby is unreachable. The carried `signal`
+ * is the lobby's envelope, unchanged — the broker is a postman, so SDP and
+ * candidates stay direct-only. `ttl` counts remaining *forward* hops: senders
+ * set 1, a forwarder delivers or passes it on at 0, and nothing is ever flooded
+ * to more than one peer. `id` dedups a signal that arrives by two routes.
+ */
+export interface SigRelayFrame {
+  v: typeof WIRE_VERSION
+  k: "sig-relay"
+  /** Relay dedup id. */
+  id: string
+  /** Remaining forward hops. */
+  ttl: number
+  /** The peer the carried signal came from (not the forwarding peer). */
+  from: PeerId
+  /** The peer the carried signal is ultimately for. */
+  to: PeerId
+  /** The signalling envelope, byte-identical to what the lobby would carry. */
+  signal: SignallingMessage
+}
+
 /** Liveness / latency probe. */
 export interface PingFrame {
   v: typeof WIRE_VERSION
@@ -152,6 +176,7 @@ export type Frame =
   | SubFrame
   | PubFrame
   | GossipFrame
+  | SigRelayFrame
   | ChunkFrame
   | PingFrame
   | PongFrame
@@ -179,6 +204,7 @@ const KINDS: ReadonlySet<string> = new Set<FrameKind>([
   "unsub",
   "pub",
   "gossip",
+  "sig-relay",
   "chunk",
   "ping",
   "pong",
@@ -282,6 +308,20 @@ export function validateFrame(value: unknown): asserts value is Frame {
         (f.i as number) < (f.n as number) &&
         typeof f.part === "string"
       break
+    case "sig-relay": {
+      // The carried envelope is only shape-checked here; the receiving
+      // RTCTransport re-checks `from`/`to` against its own session.
+      const signal = f.signal as Record<string, unknown> | undefined
+      const carried =
+        !!signal &&
+        typeof signal === "object" &&
+        typeof signal["from"] === "string" &&
+        (signal["announce"] === true ||
+          (typeof signal["description"] === "object" && signal["description"] !== null) ||
+          (typeof signal["iceCandidate"] === "object" && signal["iceCandidate"] !== null))
+      valid = str("id") && str("from") && str("to") && int("ttl") && carried
+      break
+    }
     case "ping":
     case "pong":
       valid = str("id")

@@ -16,6 +16,12 @@ type WebSocketCtor = new (url: string) => WebSocketLike
 export interface WebSocketSignallingOptions {
   /** Override the WebSocket constructor (defaults to native, then the `ws` package). */
   WebSocket?: WebSocketCtor
+  /**
+   * Called once the socket has opened and then dropped (or errored). Lets a
+   * caller switch to another route — peer-brokered signalling, say — rather than
+   * keep writing into a dead socket.
+   */
+  onDown?: () => void
 }
 
 const OPEN = 1
@@ -31,8 +37,11 @@ export class WebSocketSignalling implements SignallingChannel {
   private ws?: WebSocketLike
   private readonly handlers = new Set<(message: SignallingMessage) => void>()
   private readonly outbox: string[] = []
+  private readonly onDown?: () => void
+  private opened = false
 
   constructor(url: string, options: WebSocketSignallingOptions = {}) {
+    this.onDown = options.onDown
     this.ready = this.connect(url, options)
   }
 
@@ -58,10 +67,16 @@ export class WebSocketSignalling implements SignallingChannel {
 
     await new Promise<void>((resolve, reject) => {
       ws.onopen = () => {
+        this.opened = true
         for (const raw of this.outbox.splice(0)) ws.send(raw)
         resolve()
       }
       ws.onerror = err => reject(err instanceof Error ? err : new Error("signalling socket error"))
+      ws.onclose = () => {
+        // A socket that opened and then dropped is a lobby we can no longer
+        // reach; one that never opened is reported through `ready` instead.
+        if (this.opened) this.onDown?.()
+      }
     })
   }
 

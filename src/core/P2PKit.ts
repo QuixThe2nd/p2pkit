@@ -1,6 +1,9 @@
 import type { PeerId } from "../utils/types.js"
 import { NoopSigner, type Signer } from "../auth/signer.js"
 import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
+import { SignalBroker, type SignalBrokerHost, type SignalBrokerOptions } from "../signalling/broker.js"
+import { WebSocketSignalling, type WebSocketSignallingOptions } from "../signalling/websocket.js"
+import type { SigRelayFrame } from "../wire/index.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Transport } from "../transports/types.js"
 import type { Frame, BcastFrame, SubFrame, PubFrame, GossipFrame } from "../wire/index.js"
@@ -23,11 +26,22 @@ export interface BroadcastOptions {
   dedupWindow?: number
 }
 
+/**
+ * How to reach the other peers before a link exists. Only the lobby is built in;
+ * anything else is a {@link SignallingChannel} you supply yourself.
+ */
+export type BootstrapSource = { kind: "lobby"; url: string }
+
 export interface P2PKitOptions {
   /** This node's id. Derived from `signer` when given; required otherwise. */
   self?: PeerId
   /** Signalling channel peers use to find and connect to each other. */
-  signalling: SignallingChannel
+  signalling?: SignallingChannel
+  /**
+   * Bootstrap without building a signalling channel yourself (README §2). Give
+   * this **or** `signalling`. Currently only the WebSocket lobby is built in.
+   */
+  bootstrap?: BootstrapSource
   /** Identity signer; enables verified handshakes, encryption and signed broadcasts. */
   signer?: Signer
   backend?: RTCBackend | RTCBackendSource
@@ -50,6 +64,16 @@ export interface P2PKitOptions {
   rpcTimeout?: number
   /** Discovery channels to grow/heal the mesh beyond the signalling room (README §4). */
   discovery?: Discovery | Discovery[]
+  /**
+   * Carry handshake signals over existing links when the signalling channel is
+   * unreachable (README §4). Default `false`; with it off, a dead lobby means no
+   * new connections.
+   */
+  brokeredSignalling?: boolean
+  /** Options for the lobby built by `bootstrap`. */
+  signallingOptions?: WebSocketSignallingOptions
+  /** Options for the peer-brokered relay path enabled by `brokeredSignalling`. */
+  brokerOptions?: SignalBrokerOptions
   /**
    * Advanced: supply a transport for a peer instead of the default WebRTC one.
    * Return `undefined` to fall back to WebRTC. Enables custom link types and
@@ -92,13 +116,15 @@ const REPLAY_WINDOW = 1024
  * whole-mesh {@link P2PKit.broadcast} flooding and subscription-scoped
  * {@link P2PKit.topic} pub/sub.
  */
-export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
+export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBrokerHost {
   /** Directly-connected peers, keyed by id. */
   readonly peers = new Map<PeerId, Peer<Msg>>()
 
   private readonly options: P2PKitOptions
   private readonly signer: Signer | undefined
   private readonly signalling: SignallingChannel
+  private readonly broker?: SignalBroker
+  private readonly lobby?: WebSocketSignalling
   private readonly emitter = new Emitter<P2PKitEvents<Msg>>()
   private readonly ttl: number
 
@@ -128,7 +154,29 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
   constructor(options: P2PKitOptions) {
     this.options = options
     this.signer = options.signer
-    this.signalling = options.signalling
+    // Assigned below, before the lobby's `onDown` can possibly fire; `this` is
+    // safe as a broker host because every field it reads is initialised ahead
+    // of this constructor body.
+    let broker: SignalBroker | undefined
+    let lobby: WebSocketSignalling | undefined
+    const source = options.bootstrap
+    if (!options.signalling && source) {
+      if (source.kind !== "lobby") throw new Error(`unsupported bootstrap kind: ${source.kind}`)
+      lobby = new WebSocketSignalling(source.url, {
+        ...options.signallingOptions,
+        onDown: () => broker?.markLobbyDown(),
+      })
+      this.lobby = lobby
+    }
+    const upstream = options.signalling ?? lobby
+    if (!upstream) throw new Error("P2PKit requires `signalling` or a `bootstrap` source")
+    if (options.brokeredSignalling) {
+      broker = new SignalBroker(upstream, this, options.brokerOptions)
+      this.broker = broker
+      this.signalling = broker
+    } else {
+      this.signalling = upstream
+    }
     this.ttl = options.broadcast?.ttl ?? DEFAULT_TTL
     const dedupWindow = options.broadcast?.dedupWindow ?? DEFAULT_DEDUP_WINDOW
     this.bcastSeen = new SeenCache(dedupWindow)
@@ -174,6 +222,8 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
     for (const discovery of this.discoveries) discovery.stop()
     for (const peer of this.peers.values()) peer.disconnect()
     this.peers.clear()
+    this.broker?.stop()
+    this.lobby?.close()
   }
 
   /** Flood a message across the whole mesh (README §1). */
@@ -220,7 +270,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
     const peer = new Peer<Msg>({
       self: this._self,
       remote,
-      signalling: this.signalling,
+      signalling: this.broker ? this.broker.channelFor(remote) : this.signalling,
       signer: this.signer,
       backend: this.options.backend,
       iceServers: this.options.iceServers,
@@ -266,6 +316,14 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
 
   onGossip(handler: (from: PeerId, peers: PeerId[]) => void): () => void {
     return this.discoveryEvents.on("gossip", handler)
+  }
+
+  // ---- peer-brokered signalling (SignalBrokerHost) -----------------------
+
+  /** Send one frame onto a direct link (satisfies {@link SignalBrokerHost}). */
+  sendTo(peer: PeerId, frame: Frame): void {
+    const target = this.peers.get(peer)
+    if (target?.connected) void target.sendFrame(frame).catch(err => this.reportError(err))
   }
 
   /**
@@ -423,6 +481,9 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
       case "gossip":
         this.onGossipFrame(frame, from)
         return
+      case "sig-relay":
+        this.onSigRelay(frame)
+        return
       default:
         // req/res (RPC) are consumed inside Peer, before the frame event.
         return
@@ -431,6 +492,17 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost {
 
   private onGossipFrame(frame: GossipFrame, from: Peer<Msg>): void {
     this.discoveryEvents.emit("gossip", from.remote, frame.peers)
+  }
+
+  /**
+   * A handshake signal carried over a link because the lobby is unreachable.
+   * Opening the slot for an unknown origin is what `announce` does on the lobby:
+   * without it the signal has no transport to arrive at.
+   */
+  private onSigRelay(frame: SigRelayFrame): void {
+    if (!this._self || !this.broker) return
+    if (frame.to === this._self) this.ensurePeer(frame.from)
+    this.broker.ingest(frame)
   }
 
   private onSubscription(frame: SubFrame, from: Peer<Msg>): void {
