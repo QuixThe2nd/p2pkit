@@ -80,11 +80,14 @@ export class SignalBroker implements SignallingChannel {
   private offConnected?: () => void
   private lobbyUp = true
   private lobbySettled = false
+  private readonly settleReady: () => void
 
   /**
-   * Resolves once the lobby has answered, or immediately if it never will — a
-   * lobby that refuses us must not fail `start()`, because the mesh is still
-   * reachable through peers learned another way.
+   * Resolves once the lobby has answered, or as soon as we learn it never
+   * will. A lobby that refuses us must not hang `start()`, because the mesh is
+   * still reachable through peers learned another way — and an upstream whose
+   * `ready` only ever retries (a reconnecting channel, say) reports "never"
+   * through {@link markLobbyDown}, not through a rejected promise.
    */
   readonly ready: Promise<void>
 
@@ -104,12 +107,14 @@ export class SignalBroker implements SignallingChannel {
       this.lobbySettled = true
       this.lobbyUp = false
     })
-    this.ready = upstream.ready.then(
-      () => {
-        this.lobbySettled = true
-      },
-      () => {},
-    )
+    let settle!: () => void
+    this.ready = new Promise<void>(resolve => {
+      settle = resolve
+    }).then(() => {
+      this.lobbySettled = true
+    })
+    this.settleReady = settle
+    upstream.ready.then(() => settle(), () => settle())
     upstream.onMessage(message => this.deliver(message))
     this.offConnected = host.onPeerConnected(peer => this.flushPending(peer))
   }
@@ -138,6 +143,8 @@ export class SignalBroker implements SignallingChannel {
   /** Stop relaying through the lobby and use peer links instead. */
   markLobbyDown(): void {
     this.lobbyUp = false
+    // An upstream that will never answer must not hold `ready` open.
+    this.settleReady()
   }
 
   /** The signalling channel is reachable again; go back to passing through. */

@@ -279,8 +279,19 @@ describe("SignalBroker (unit)", () => {
     expect(rec.sent).toEqual([])
   })
 
-  it("goes back to passing through once the lobby is reported up again", async () => {
+  it("settles ready when the lobby is reported down, even if it never answers", async () => {
+    // A reconnecting channel retries forever rather than rejecting: without
+    // this, `await ready` would hang and the node would never start.
     const rec = recorder("A", ["B"])
+    const neverReady = { ready: new Promise<void>(() => {}), send: () => {}, onMessage: () => () => {} }
+    const broker = new SignalBroker(neverReady as never, rec.host)
+    broker.markLobbyDown()
+
+    await broker.ready
+    expect(broker.lobbyAlive).toBe(false)
+  })
+
+  it("goes back to passing through once the lobby is reported up again", async () => {    const rec = recorder("A", ["B"])
     const upstream = lobby()
     const broker = new SignalBroker(upstream.channel as never, rec.host)
     await broker.ready
