@@ -110,12 +110,15 @@ export interface MeshNodeOptions {
 /**
  * Build an in-memory mesh with an explicit topology. `edges` control who can
  * connect to whom, letting tests exercise multi-hop relay/routing (e.g. a line
- * A–B–C where A and C are not directly connected).
+ * A–B–C where A and C are not directly connected). Ids in `opts.late` are built
+ * but not started — the test starts them itself to model joining after the mesh
+ * has already formed.
  */
 export async function buildMesh<Msg = unknown>(
   ids: PeerId[],
   edges: [PeerId, PeerId][],
   perNode: (id: PeerId) => MeshNodeOptions = () => ({}),
+  opts: { late?: PeerId[] } = {},
 ): Promise<Map<PeerId, P2PKit<Msg>>> {
   const bus = new MeshBus()
   const registry = new TransportRegistry()
@@ -124,18 +127,19 @@ export async function buildMesh<Msg = unknown>(
   for (const id of ids) {
     const signalling = new TestSignalling(id, bus)
     bus.register(id, signalling)
-    const opts = perNode(id)
+    const nodeOpts = perNode(id)
     const kit = new P2PKit<Msg>({
       self: id,
       signalling,
       createTransport: ({ self, remote }) => registry.end(self, remote),
-      ...opts,
+      ...nodeOpts,
     })
     nodes.set(id, kit)
   }
   for (const [a, b] of edges) bus.connect(a, b)
 
-  await Promise.all([...nodes.values()].map(k => k.start()))
+  const late = new Set(opts.late)
+  await Promise.all([...nodes].filter(([id]) => !late.has(id)).map(([, kit]) => kit.start()))
   // Let announces propagate and transports open.
   await new Promise(r => setTimeout(r, 30))
   return nodes

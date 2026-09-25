@@ -14,6 +14,12 @@ const DEFAULT_MAX_SHARE = 32
  * rest of the mesh: on each new connection we send our peer list, and on each
  * inbound list we connect to any id we don't already know.
  *
+ * The trade runs both ways: a link that just came up is announced to the peers
+ * we were already linked to as well. Without that, a peer joining through a
+ * single link stays invisible to the rest of the mesh — its id never reaches
+ * anyone but the peer it seeded from, and nobody offers to it (the smaller id
+ * offers, so a peer that has never heard of us certainly doesn't).
+ *
  * Fan-out is bounded by transport reachability — an id only becomes a connection
  * if the host can actually reach it (a shared signalling room, or a by-id
  * transport such as the DHT). Gossip supplies the *who*; the transport the *how*.
@@ -39,7 +45,7 @@ export class GossipDiscovery implements Discovery {
     this.host = undefined
   }
 
-  /** A peer just connected: tell it about everyone else we know. */
+  /** A peer just connected: trade peer lists, and introduce it to the rest. */
   private exchange(peer: PeerId): void {
     const host = this.host
     if (!host) return
@@ -47,6 +53,12 @@ export class GossipDiscovery implements Discovery {
       .peerIds()
       .filter(p => p !== peer)
       .slice(0, this.maxShare)
+    // One id per existing link, so the newcomer is dialable from everywhere and
+    // not just from the peer it first reached. Inbound lists dedup, and each
+    // link announces a given peer at most once, so this terminates.
+    for (const other of host.peerIds()) {
+      if (other !== peer && other !== host.self) host.sendGossip(other, [peer])
+    }
     if (share.length > 0) host.sendGossip(peer, share)
   }
 

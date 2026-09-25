@@ -156,17 +156,18 @@ describe("SignalBroker (unit)", () => {
     expect(broker.pendingCount).toBe(1)
   })
 
-  it("sends a relay back along the link it arrived on", () => {
-    // Linked to two peers, neither of them the destination: the answer has to
-    // go back the way the offer came, or it lands on a peer that cannot
-    // reach C either.
+  it("holds a relay it cannot forward instead of bouncing it back", () => {
+    // A handed us a relay for C and neither of our links reaches C. Sending it
+    // back to A is a loop: A has already seen this id, so dedup would drop it
+    // and the signal would be lost. Holding it is the only sound move — if C
+    // links to us later, the held relay flushes.
     const rec = recorder("B", ["A", "D"])
     const broker = new SignalBroker(lobby().channel as never, rec.host)
 
     broker.ingest(relayFrame({ ttl: 1 }), "A")
 
-    expect(rec.sent).toHaveLength(1)
-    expect(rec.sent[0]!.to).toBe("A")
+    expect(rec.sent).toEqual([])
+    expect(broker.pendingCount).toBe(1)
   })
 
   it("still prefers a direct link to the destination over the arrival link", () => {

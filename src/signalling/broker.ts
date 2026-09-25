@@ -214,7 +214,7 @@ export class SignalBroker implements SignallingChannel {
     // One forward hop, and only straight to the destination: never flooded to
     // the rest of our neighbours, and never carried past `ttl` 0.
     if (frame.ttl < 1) return
-    this.relay({ ...frame, ttl: frame.ttl - 1 }, via)
+    this.relay({ ...frame, ttl: frame.ttl - 1 })
   }
 
   /** Release timers and per-link state; the host is going away. */
@@ -252,17 +252,15 @@ export class SignalBroker implements SignallingChannel {
 
   /**
    * Hand a relay onward: straight to the destination if we are linked to it,
-   * else back along the link it arrived on, else held briefly in case such a
-   * link comes up — the peer we are relaying to may be dialing too.
+   * else held briefly in case such a link comes up — the peer we would carry it
+   * to may be dialing too. Never back along the link it arrived on: whoever
+   * sent it has already failed to deliver it there, so the frame would only
+   * meet its own dedup and die.
    */
-  private relay(frame: SigRelayFrame, via?: PeerId): void {
+  private relay(frame: SigRelayFrame): void {
     const linked = this.host.linkedPeers()
     if (linked.includes(frame.to)) {
       this.host.sendTo(frame.to, frame)
-      return
-    }
-    if (via !== undefined && linked.includes(via)) {
-      this.host.sendTo(via, frame)
       return
     }
     if (this.pending.size >= this.maxPending) {
