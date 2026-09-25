@@ -138,6 +138,11 @@ export class SignalBroker implements SignallingChannel {
     this.lobbyUp = false
   }
 
+  /** The signalling channel is reachable again; go back to passing through. */
+  markLobbyUp(): void {
+    this.lobbyUp = true
+  }
+
   /** Whether the lobby is still believed reachable. */
   get lobbyAlive(): boolean {
     return this.lobbyUp

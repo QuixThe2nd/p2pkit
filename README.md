@@ -249,7 +249,7 @@ const kit = new P2PKit({
 - **Announces cannot be relayed** — they are addressed to a whole room, not to a peer. Once the lobby is down, discovery is what tells you who exists.
 - Gossip alone still cannot bootstrap a first link: something has to be linked before anything can be carried over it. Brokered signalling heals a mesh, it does not create one.
 
-Passing `bootstrap` lets you give a lobby URL without importing `WebSocketSignalling`; `signalling` still works and takes precedence when both are given. `bootstrap` builds the lobby socket, so when it drops mid-session the kit is told and switches to the relay path on its own.
+Passing `bootstrap` lets you give a lobby URL without importing `WebSocketSignalling`; `signalling` still works and takes precedence when both are given. `bootstrap` builds the lobby socket, so when it drops mid-session the kit is told and switches to the relay path on its own. A channel you built yourself has no liveness signal for the kit to observe, so report it with `kit.markSignallingDown()` / `kit.markSignallingUp()` — both no-ops when `brokeredSignalling` is off.
 
 ---
 

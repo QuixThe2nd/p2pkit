@@ -320,6 +320,21 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
 
   // ---- peer-brokered signalling (SignalBrokerHost) -----------------------
 
+  /**
+   * Report the signalling channel unreachable, so outbound signals switch to
+   * the relay path (README §4.1). `bootstrap` reports this itself; a channel
+   * you supplied has to, since `SignallingChannel` carries no liveness signal.
+   * No-op without `brokeredSignalling`.
+   */
+  markSignallingDown(): void {
+    this.broker?.markLobbyDown()
+  }
+
+  /** Report the signalling channel reachable again (see {@link markSignallingDown}). */
+  markSignallingUp(): void {
+    this.broker?.markLobbyUp()
+  }
+
   /** Send one frame onto a direct link (satisfies {@link SignalBrokerHost}). */
   sendTo(peer: PeerId, frame: Frame): void {
     const target = this.peers.get(peer)

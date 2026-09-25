@@ -240,6 +240,25 @@ describe("SignalBroker (unit)", () => {
     expect(upstream.sent).toEqual([])
     expect(rec.sent).toEqual([])
   })
+
+  it("goes back to passing through once the lobby is reported up again", async () => {
+    const rec = recorder("A", ["B"])
+    const upstream = lobby()
+    const broker = new SignalBroker(upstream.channel as never, rec.host)
+    await broker.ready
+    const message = { description: { type: "offer", sdp: "v=0" }, from: "A", to: "B" } as const
+
+    broker.markLobbyDown()
+    broker.send(message)
+    expect(upstream.sent).toEqual([])
+    expect(rec.sent).toHaveLength(1)
+
+    broker.markLobbyUp()
+    broker.send(message)
+
+    expect(upstream.sent).toEqual([message])
+    expect(rec.sent).toHaveLength(1) // nothing further relayed
+  })
 })
 
 describe("brokered signalling over real WebRTC", () => {
