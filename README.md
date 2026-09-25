@@ -245,7 +245,7 @@ const kit = new P2PKit({
 
 - **Off by default.** With it off, a dead lobby means no new connections, exactly as before.
 - **The broker is a postman.** The carried envelope is the lobby's `{announce}` / `{description}` / `{iceCandidate}`, unchanged, so SDP and candidates stay direct-only and every check in `RTCTransport` still applies. Identity is still proven by the hello/ack handshake, not by whoever carried the signal.
-- **One hop, no flooding.** A relay is handed to a single connected peer, forwarded only to a peer the forwarder is directly linked to, and never carried past `ttl` 0. Duplicates are dropped by id; a relay whose destination never links is dropped after `brokerOptions.relayTimeoutMs` (default 15000).
+- **One hop, no flooding.** A relay is handed to a single connected peer, forwarded only to a peer the forwarder is directly linked to, and never carried past `ttl` 0. A relay for a peer we are linked to goes straight down that link; one we must forward comes back along the link it arrived on, since that peer reached the destination a moment ago and our other neighbours may not be able to. Duplicates are dropped by id; a relay whose destination never links is dropped after `brokerOptions.relayTimeoutMs` (default 15000).
 - **Announces cannot be relayed** — they are addressed to a whole room, not to a peer. Once the lobby is down, discovery is what tells you who exists.
 - Gossip alone still cannot bootstrap a first link: something has to be linked before anything can be carried over it. Brokered signalling heals a mesh, it does not create one.
 

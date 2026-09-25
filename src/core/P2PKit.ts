@@ -321,6 +321,15 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
   // ---- peer-brokered signalling (SignalBrokerHost) -----------------------
 
   /**
+   * Peers a frame can be pushed onto right now — the handshake is complete.
+   * Narrower than {@link peerIds}, which deliberately counts a peer we are
+   * still dialing so discovery can share it.
+   */
+  linkedPeers(): PeerId[] {
+    return [...this.peers.values()].filter(p => p.connected).map(p => p.remote)
+  }
+
+  /**
    * Report the signalling channel unreachable, so outbound signals switch to
    * the relay path (README §4.1). `bootstrap` reports this itself; a channel
    * you supplied has to, since `SignallingChannel` carries no liveness signal.
@@ -497,7 +506,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
         this.onGossipFrame(frame, from)
         return
       case "sig-relay":
-        this.onSigRelay(frame)
+        this.onSigRelay(frame, from.remote)
         return
       default:
         // req/res (RPC) are consumed inside Peer, before the frame event.
@@ -514,10 +523,10 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
    * Opening the slot for an unknown origin is what `announce` does on the lobby:
    * without it the signal has no transport to arrive at.
    */
-  private onSigRelay(frame: SigRelayFrame): void {
+  private onSigRelay(frame: SigRelayFrame, via: PeerId): void {
     if (!this._self || !this.broker) return
     if (frame.to === this._self) this.ensurePeer(frame.from)
-    this.broker.ingest(frame)
+    this.broker.ingest(frame, via)
   }
 
   private onSubscription(frame: SubFrame, from: Peer<Msg>): void {

@@ -13,8 +13,10 @@ import type { SignallingChannel, SignallingMessage } from "./types.js"
 export interface SignalBrokerHost {
   /** This node's id. */
   readonly self: PeerId
-  /** Ids of the currently-connected peers. */
+  /** Ids of the peers we know about, links still being dialed included. */
   peerIds(): PeerId[]
+  /** Ids of the peers a frame can be pushed onto right now. */
+  linkedPeers(): PeerId[]
   /** Send one frame to a directly-connected peer (a no-op if it has dropped). */
   sendTo(peer: PeerId, frame: Frame): void
   /** Subscribe to a peer connecting; relays held for that peer flush on this. */
@@ -159,7 +161,9 @@ export class SignalBroker implements SignallingChannel {
     // it; discovery is what supplies peers once the lobby is gone.
     if (!("to" in message) || message.to === undefined) return
     if (JSON.stringify(message).length > MAX_SIGNAL_CHARS) return
-    const carrier = this.pickCarrier()
+    // A peer we are linked to needs no intermediary — the far end unwraps it.
+    const linked = this.host.linkedPeers()
+    const carrier = linked.includes(message.to) ? message.to : this.pickCarrier()
     if (!carrier) return
     this.host.sendTo(carrier, {
       v: WIRE_VERSION,
@@ -180,8 +184,13 @@ export class SignalBroker implements SignallingChannel {
     }
   }
 
-  /** A `sig-relay` frame arrived over a link: deliver it, or carry it one hop. */
-  ingest(frame: SigRelayFrame): void {
+  /**
+   * A `sig-relay` frame arrived over a link: deliver it, or carry it one hop.
+   * `via` is the peer the frame arrived from, when the host knows it — a relay
+   * is sent back along the path it came in on, since that peer could reach the
+   * destination a moment ago and the rest of our neighbours may not be able to.
+   */
+  ingest(frame: SigRelayFrame, via?: PeerId): void {
     if (frame.from === this.host.self) return
     if (this.seen.seen(frame.id)) return
     if (frame.to === this.host.self) {
@@ -191,7 +200,7 @@ export class SignalBroker implements SignallingChannel {
     // One forward hop, and only straight to the destination: never flooded to
     // the rest of our neighbours, and never carried past `ttl` 0.
     if (frame.ttl < 1) return
-    this.relay({ ...frame, ttl: frame.ttl - 1 })
+    this.relay({ ...frame, ttl: frame.ttl - 1 }, via)
   }
 
   /** Release timers and per-link state; the host is going away. */
@@ -227,12 +236,18 @@ export class SignalBroker implements SignallingChannel {
   }
 
   /**
-   * Hand a relay to `to` if we are linked to it, otherwise hold it briefly in
-   * case that link comes up — the peer we are relaying to may be dialing too.
+   * Hand a relay onward: straight to the destination if we are linked to it,
+   * else back along the link it arrived on, else held briefly in case such a
+   * link comes up — the peer we are relaying to may be dialing too.
    */
-  private relay(frame: SigRelayFrame): void {
-    if (this.host.peerIds().includes(frame.to)) {
+  private relay(frame: SigRelayFrame, via?: PeerId): void {
+    const linked = this.host.linkedPeers()
+    if (linked.includes(frame.to)) {
       this.host.sendTo(frame.to, frame)
+      return
+    }
+    if (via !== undefined && linked.includes(via)) {
+      this.host.sendTo(via, frame)
       return
     }
     if (this.pending.size >= this.maxPending) {
@@ -261,8 +276,8 @@ export class SignalBroker implements SignallingChannel {
     this.pending.delete(id)
   }
 
-  /** Any connected peer can carry the relay. */
+  /** Any peer we are linked to can carry the relay. */
   private pickCarrier(): PeerId | undefined {
-    return this.host.peerIds()[0]
+    return this.host.linkedPeers()[0]
   }
 }

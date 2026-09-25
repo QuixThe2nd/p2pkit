@@ -85,6 +85,7 @@ const recorder = (self: string, linked: string[] = []): Recorder => {
     host: {
       self,
       peerIds: () => [...rec.linked],
+      linkedPeers: () => [...rec.linked],
       sendTo: (to, frame) => rec.sent.push({ to, frame }),
       onPeerConnected: handler => {
         rec.arrive = handler
@@ -153,6 +154,29 @@ describe("SignalBroker (unit)", () => {
 
     expect(rec.sent).toEqual([])
     expect(broker.pendingCount).toBe(1)
+  })
+
+  it("sends a relay back along the link it arrived on", () => {
+    // Linked to two peers, neither of them the destination: the answer has to
+    // go back the way the offer came, or it lands on a peer that cannot
+    // reach C either.
+    const rec = recorder("B", ["A", "D"])
+    const broker = new SignalBroker(lobby().channel as never, rec.host)
+
+    broker.ingest(relayFrame({ ttl: 1 }), "A")
+
+    expect(rec.sent).toHaveLength(1)
+    expect(rec.sent[0]!.to).toBe("A")
+  })
+
+  it("still prefers a direct link to the destination over the arrival link", () => {
+    const rec = recorder("B", ["A", "C"])
+    const broker = new SignalBroker(lobby().channel as never, rec.host)
+
+    broker.ingest(relayFrame({ ttl: 1 }), "A")
+
+    expect(rec.sent).toHaveLength(1)
+    expect(rec.sent[0]!.to).toBe("C")
   })
 
   it("sends a held relay once the destination links", () => {
@@ -226,6 +250,20 @@ describe("SignalBroker (unit)", () => {
     const frame = rec.sent[0]!.frame as SigRelayFrame
     expect(frame).toMatchObject({ k: "sig-relay", ttl: 1, from: "A", to: "B" })
     expect(frame.signal).toEqual(message)
+  })
+
+  it("sends a signal destined for a linked peer straight down that link", async () => {
+    // A is linked to both B and C; an offer for B must not detour through C.
+    const rec = recorder("A", ["B", "C"])
+    const upstream = lobby()
+    const broker = new SignalBroker(upstream.channel as never, rec.host)
+    await broker.ready
+    broker.markLobbyDown()
+
+    broker.send({ description: { type: "offer", sdp: "v=0" }, from: "A", to: "C" })
+
+    expect(rec.sent).toHaveLength(1)
+    expect(rec.sent[0]!.to).toBe("C")
   })
 
   it("drops an announce when there is no lobby to address it to", async () => {
