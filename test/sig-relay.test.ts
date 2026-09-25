@@ -179,6 +179,23 @@ describe("SignalBroker (unit)", () => {
     expect(rec.sent[0]!.to).toBe("C")
   })
 
+  it("sends the reply to a relayed signal back to the carrier it came from", async () => {
+    // Linked to A and D, the signal is from C via A: answering through D would
+    // strand it wherever D cannot forward it.
+    const rec = recorder("B", ["A", "D"])
+    const upstream = lobby()
+    const broker = new SignalBroker(upstream.channel as never, rec.host)
+    await broker.ready
+    broker.markLobbyDown()
+
+    broker.ingest(relayFrame({ to: "B", from: "C" }), "A")
+    broker.send({ description: { type: "answer", sdp: "v=0" }, from: "B", to: "C" })
+
+    expect(upstream.sent).toEqual([])
+    expect(rec.sent).toHaveLength(1)
+    expect(rec.sent[0]!.to).toBe("A")
+  })
+
   it("sends a held relay once the destination links", () => {
     const rec = recorder("B", ["X"])
     const broker = new SignalBroker(lobby().channel as never, rec.host)

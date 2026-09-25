@@ -75,6 +75,12 @@ export class SignalBroker implements SignallingChannel {
     { frame: SigRelayFrame; timer: ReturnType<typeof setTimeout> }
   >()
   private readonly seen: SeenCache
+  /**
+   * The neighbour each remote's signals last arrived from. `pickCarrier` sends
+   * a signal back that way, which is the only routing this broker knows — and
+   * the only one it needs, since a relay travels one hop at a time.
+   */
+  private readonly routes = new Map<PeerId, PeerId>()
   private readonly relayTimeoutMs: number
   private readonly maxPending: number
   private offConnected?: () => void
@@ -147,14 +153,14 @@ export class SignalBroker implements SignallingChannel {
     this.settleReady()
   }
 
-  /** The signalling channel is reachable again; go back to passing through. */
-  markLobbyUp(): void {
-    this.lobbyUp = true
-  }
-
   /** Whether the lobby is still believed reachable. */
   get lobbyAlive(): boolean {
     return this.lobbyUp
+  }
+
+  /** The signalling channel is reachable again; go back to passing through. */
+  markLobbyUp(): void {
+    this.lobbyUp = true
   }
 
   send(message: SignallingMessage): void {
@@ -168,9 +174,7 @@ export class SignalBroker implements SignallingChannel {
     // it; discovery is what supplies peers once the lobby is gone.
     if (!("to" in message) || message.to === undefined) return
     if (JSON.stringify(message).length > MAX_SIGNAL_CHARS) return
-    // A peer we are linked to needs no intermediary — the far end unwraps it.
-    const linked = this.host.linkedPeers()
-    const carrier = linked.includes(message.to) ? message.to : this.pickCarrier()
+    const carrier = this.pickCarrier(message.to)
     if (!carrier) return
     this.host.sendTo(carrier, {
       v: WIRE_VERSION,
@@ -201,6 +205,9 @@ export class SignalBroker implements SignallingChannel {
     if (frame.from === this.host.self) return
     if (this.seen.seen(frame.id)) return
     if (frame.to === this.host.self) {
+      // Remember the link this peer's signals arrive on: the answer has to go
+      // back the same way, and whoever carried it here can reach them.
+      if (via !== undefined) this.routes.set(frame.from, via)
       this.deliver(frame.signal)
       return
     }
@@ -215,6 +222,7 @@ export class SignalBroker implements SignallingChannel {
     for (const { timer } of this.pending.values()) clearTimeout(timer)
     this.pending.clear()
     this.remotes.clear()
+    this.routes.clear()
     this.offConnected?.()
     this.offConnected = undefined
   }
@@ -283,8 +291,16 @@ export class SignalBroker implements SignallingChannel {
     this.pending.delete(id)
   }
 
-  /** Any peer we are linked to can carry the relay. */
-  private pickCarrier(): PeerId | undefined {
-    return this.host.linkedPeers()[0]
+  /**
+   * The neighbour to hand a signal for `to` through: the peer itself if we are
+   * linked to it, else the link its last signal arrived on (a reply goes back
+   * the way the request came), else whichever peer we are linked to.
+   */
+  private pickCarrier(to: PeerId): PeerId | undefined {
+    const linked = this.host.linkedPeers()
+    if (linked.includes(to)) return to
+    const known = this.routes.get(to)
+    if (known !== undefined && linked.includes(known)) return known
+    return linked[0]
   }
 }
