@@ -235,21 +235,25 @@ The DHT transport (§6) and DHT discovery run on **one shared DHT node** - set `
 
 Discovery supplies *who* to reach; the transport decides *how*. When the lobby is gone there is normally no "how" left, so no new link can form. `brokeredSignalling` supplies one: a handshake signal for a peer we are not linked to is wrapped in a `sig-relay` frame and carried over an existing link, and the peer at the far end delivers it to its own transport as if the lobby had sent it.
 
+**On by default on the `bootstrap` path.** Bootstrapping with a lobby URL composes the whole self-healing stack — a reconnecting lobby socket, brokered signalling, and gossip discovery — so the mesh keeps growing through lobby outages without the app wiring anything:
+
 ```ts
 const kit = new P2PKit({
   bootstrap: { kind: "lobby", url: "wss://rooms.example/room-1" },
-  brokeredSignalling: true, // default false
-  discovery: new GossipDiscovery(),
+  // brokeredSignalling: true, gossip discovery, lobby reconnect — all on.
+  // Opt out with brokeredSignalling: false, discovery: false, or
+  // signallingOptions: { reconnect: false }.
 })
 ```
 
-- **Off by default.** With it off, a dead lobby means no new connections, exactly as before.
+With a self-supplied `signalling` channel the broker stays **off by default** — pass `brokeredSignalling: true` (and your own `discovery`) to opt in, exactly as before.
+
 - **The broker is a postman.** The carried envelope is the lobby's `{announce}` / `{description}` / `{iceCandidate}`, unchanged, so SDP and candidates stay direct-only and every check in `RTCTransport` still applies. Identity is still proven by the hello/ack handshake, not by whoever carried the signal.
-- **One hop, no flooding.** A relay is handed to a single connected peer, forwarded only to a peer the forwarder is directly linked to, and never carried past `ttl` 0. A relay for a peer we are linked to goes straight down that link; one we must forward comes back along the link it arrived on, since that peer reached the destination a moment ago and our other neighbours may not be able to. Duplicates are dropped by id; a relay whose destination never links is dropped after `brokerOptions.relayTimeoutMs` (default 15000).
+- **One hop, bounded fanout, no flooding.** A relay is forwarded only to a peer the forwarder is directly linked to, and never carried past `ttl` 0. A relay for a peer we are linked to goes straight down that link; one whose route is known comes back along the link it arrived on; one whose route is unknown is fanned out — once, under a single frame id that dedups the copies — across the sender's direct neighbours, so a wrong first neighbour cannot blackhole an offer the mutual peer would have delivered. Duplicates are dropped by id; a relay whose destination never links is dropped after `brokerOptions.relayTimeoutMs` (default 15000).
 - **Announces cannot be relayed** — they are addressed to a whole room, not to a peer. Once the lobby is down, discovery is what tells you who exists.
 - Gossip alone still cannot bootstrap a first link: something has to be linked before anything can be carried over it. Brokered signalling heals a mesh, it does not create one.
 
-Passing `bootstrap` lets you give a lobby URL without importing `WebSocketSignalling`; `signalling` still works and takes precedence when both are given. `bootstrap` builds the lobby socket, so when it drops mid-session the kit is told and switches to the relay path on its own. A channel you built yourself has no liveness signal for the kit to observe, so report it with `kit.markSignallingDown()` / `kit.markSignallingUp()` — both no-ops when `brokeredSignalling` is off.
+Passing `bootstrap` lets you give a lobby URL without importing `WebSocketSignalling`; `signalling` still works and takes precedence when both are given. `bootstrap` builds the lobby socket, so when it drops mid-session the kit is told, switches to the relay path on its own, re-offers any handshake the drop orphaned, and rejoins and re-announces when the socket reconnects. A channel you built yourself has no liveness signal for the kit to observe, so report it with `kit.markSignallingDown()` / `kit.markSignallingUp()` — both no-ops when `brokeredSignalling` is off. The lobby's state is exposed separately from peer links as `kit.bootstrapStatus` (`"connecting" | "up" | "down"`, or `undefined` when nothing observes the channel) and `kit.onBootstrapStatus(handler)`.
 
 ---
 

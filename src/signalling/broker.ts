@@ -59,7 +59,9 @@ interface RemoteChannel {
  *
  * The broker is a postman: the carried envelope is the lobby's, byte for byte,
  * so the no-TURN validation in `RTCTransport` is untouched. Only direct
- * neighbours carry, and a relay is never forwarded to more than one peer.
+ * neighbours carry; a relay is forwarded only to a destination the forwarder is
+ * directly linked to, and when no route is known an outbound signal fanned out
+ * to every linked neighbour still shares one id, so copies dedup on arrival.
  *
  * Each link gets its own {@link channelFor} view, so a signal only reaches the
  * transport it is addressed to — and one that arrives just before that
@@ -76,9 +78,9 @@ export class SignalBroker implements SignallingChannel {
   >()
   private readonly seen: SeenCache
   /**
-   * The neighbour each remote's signals last arrived from. `pickCarrier` sends
-   * a signal back that way, which is the only routing this broker knows — and
-   * the only one it needs, since a relay travels one hop at a time.
+   * The neighbour each remote's signals last arrived from. `carriersFor` sends
+   * a signal back that way when it knows one, and falls back to a bounded
+   * one-hop fanout over every link when it does not.
    */
   private readonly routes = new Map<PeerId, PeerId>()
   private readonly relayTimeoutMs: number
@@ -174,9 +176,11 @@ export class SignalBroker implements SignallingChannel {
     // it; discovery is what supplies peers once the lobby is gone.
     if (!("to" in message) || message.to === undefined) return
     if (JSON.stringify(message).length > MAX_SIGNAL_CHARS) return
-    const carrier = this.pickCarrier(message.to)
-    if (!carrier) return
-    this.host.sendTo(carrier, {
+    const carriers = this.carriersFor(message.to)
+    if (carriers.length === 0) return
+    // One frame id for every carrier: a copy that meets another on the way
+    // dedups against it, so the fanout cannot multiply past the first hop.
+    const frame: SigRelayFrame = {
       v: WIRE_VERSION,
       k: "sig-relay",
       id: randomId(12),
@@ -184,7 +188,8 @@ export class SignalBroker implements SignallingChannel {
       from: this.host.self,
       to: message.to,
       signal: message,
-    })
+    }
+    for (const carrier of carriers) this.host.sendTo(carrier, frame)
   }
 
   /** Kit-level handler: everything, announces included. */
@@ -290,15 +295,20 @@ export class SignalBroker implements SignallingChannel {
   }
 
   /**
-   * The neighbour to hand a signal for `to` through: the peer itself if we are
-   * linked to it, else the link its last signal arrived on (a reply goes back
-   * the way the request came), else whichever peer we are linked to.
+   * The neighbours to hand a signal for `to` through: just the peer itself if
+   * we are linked to it, else just the link its last signal arrived on (a reply
+   * goes back the way the request came), else — the destination's route is
+   * unknown — every peer we are linked to. That fanout is the whole routing
+   * table fallback: bounded by our direct neighbour count, carried one hop
+   * (`ttl` 1, and only straight into a linked destination), and deduped by id,
+   * so a wrong first neighbour cannot blackhole an offer the mutual peer would
+   * have delivered.
    */
-  private pickCarrier(to: PeerId): PeerId | undefined {
+  private carriersFor(to: PeerId): PeerId[] {
     const linked = this.host.linkedPeers()
-    if (linked.includes(to)) return to
+    if (linked.includes(to)) return [to]
     const known = this.routes.get(to)
-    if (known !== undefined && linked.includes(known)) return known
-    return linked[0]
+    if (known !== undefined && linked.includes(known)) return [known]
+    return linked
   }
 }

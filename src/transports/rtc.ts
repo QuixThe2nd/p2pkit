@@ -295,6 +295,8 @@ export class RTCTransport<T = unknown> implements Transport<T> {
   private readonly openChannels = new Set<number>()
   private readonly pc: RTCPeerConnection
   private remoteDescriptionSet = false
+  /** Any valid signal from the remote so far — proof the negotiation is progressing. */
+  private signalReceived = false
   private readonly pendingCandidates: RTCIceCandidateInit[] = []
   private closed = false
   private emittedClose = false
@@ -776,6 +778,31 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     this.sendDescription()
   }
 
+  /**
+   * Offer again for a handshake that never completed — the signalling path the
+   * first offer went out on may have died with it (a lobby that dropped between
+   * send and delivery), or the offer arrived before the far end was listening.
+   * Only the initiator has anything to re-send; a link that is already up, or
+   * whose negotiation is provably in flight (the remote has signalled back),
+   * has nothing to gain, so all three no-op.
+   */
+  renegotiate(): void {
+    if (
+      this.closed ||
+      this.emittedClose ||
+      this.connectEmitted ||
+      !this.initiator ||
+      this.signalReceived
+    ) {
+      return
+    }
+    void this.negotiate().catch(() =>
+      this.failClosed(
+        this.direct ? "Direct connection negotiation failed" : "Connection negotiation failed",
+      ),
+    )
+  }
+
   private sendDescription(): void {
     const description = this.pc.localDescription
     if (!description) return
@@ -835,6 +862,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
     if (this.closed) return
     if ("description" in message) {
       if (message.from !== this.remote || message.to !== this.self) return
+      this.signalReceived = true
       if (this.direct) {
         validateDirectDescription(message.description)
         if (this.remoteDescriptionSet || message.description.type !== (this.initiator ? "answer" : "offer")) {
@@ -851,6 +879,7 @@ export class RTCTransport<T = unknown> implements Transport<T> {
       }
     } else if ("iceCandidate" in message) {
       if (message.from !== this.remote || message.to !== this.self) return
+      this.signalReceived = true
       if (this.direct) {
         validateDirectCandidate(message.iceCandidate)
         if (++this.candidateCount > DIRECT_MAX_SIGNALS) throw new Error("Too many candidates")

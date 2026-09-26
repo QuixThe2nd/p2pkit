@@ -5,6 +5,7 @@ export {
   type P2PKitEvents,
   type BroadcastOptions,
   type BootstrapSource,
+  type BootstrapStatus,
   type MessageMetadata,
 } from "./core/P2PKit.js"
 export { Peer, type PeerOptions, type PeerEvents } from "./core/Peer.js"

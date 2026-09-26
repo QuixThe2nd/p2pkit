@@ -1,64 +1,18 @@
 import { describe, it, expect, afterEach, vi } from "vitest"
-import { WebSocketServer, type WebSocket } from "ws"
-import type { AddressInfo } from "node:net"
 import wrtc from "@roamhq/wrtc"
 import type { P2PKitOptions } from "../src/index.js"
 import { P2PKit } from "../src/index.js"
 import { getRTC, type RTCBackend } from "../src/backends/index.js"
 import { SignalBroker, type SignalBrokerHost } from "../src/signalling/index.js"
-import { createMockSignallingServer, type MockSignallingServer } from "./helpers/signalling-server.js"
+import {
+  createMockSignallingServer,
+  createEdgeSignallingServer,
+  type MockSignallingServer,
+  type EdgeSignallingServer,
+} from "./helpers/signalling-server.js"
 import { WIRE_VERSION, type Frame, type SigRelayFrame } from "../src/wire/index.js"
 
 const settle = (ms = 200) => new Promise(r => setTimeout(r, ms))
-
-interface EdgeSignallingServer {
-  url: string
-  close(): Promise<void>
-}
-
-/**
- * A signalling relay that only forwards along the given edges, so a test can
- * shape which peers ever hear each other's announce — a line A–B–C rather than
- * the full mesh the plain mock server builds.
- */
-const createEdgeSignallingServer = async (edges: Array<[string, string]>): Promise<EdgeSignallingServer> => {
-  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 })
-  const ids = new Map<WebSocket, string>()
-  const linked = (x: string, y: string) =>
-    edges.some(([p, q]) => (p === x && q === y) || (p === y && q === x))
-
-  wss.on("connection", socket => {
-    socket.on("message", data => {
-      const raw = data.toString()
-      let from = ids.get(socket)
-      if (from === undefined) {
-        try {
-          const parsed = JSON.parse(raw) as { from?: string }
-          if (typeof parsed.from !== "string") return
-          from = parsed.from
-        } catch {
-          return
-        }
-        ids.set(socket, from)
-      }
-      for (const [peer, id] of [...ids]) {
-        if (peer !== socket && linked(from, id) && peer.readyState === peer.OPEN) peer.send(raw)
-      }
-    })
-    socket.on("close", () => ids.delete(socket))
-  })
-
-  await new Promise<void>(resolve => wss.on("listening", resolve))
-  const { port } = wss.address() as AddressInfo
-  return {
-    url: `ws://127.0.0.1:${port}`,
-    close: () =>
-      new Promise<void>(resolve => {
-        for (const socket of ids.keys()) socket.terminate()
-        wss.close(() => resolve())
-      }),
-  }
-}
 
 /** A signalling envelope the way the lobby would carry it. */
 const relayFrame = (over: Partial<SigRelayFrame> = {}): SigRelayFrame => ({
@@ -362,9 +316,16 @@ describe("brokered signalling over real WebRTC", () => {
     while (kit.peerIds().length < count && Date.now() < deadline) await settle(50)
   }
 
+  const waitLinked = async <Msg>(kit: P2PKit<Msg>, count: number) => {
+    const deadline = Date.now() + 15000
+    while (kit.linkedPeers().length < count && Date.now() < deadline) await settle(50)
+  }
+
   it("completes a handshake to a peer it is not linked to, relayed by a mutual neighbour", async () => {
-    // A–B–C: the edges decide who ever hears whose announce, so A and C start
-    // out knowing nothing of each other while B is linked to both.
+    // A–B–C: the edges decide who ever hears whose signals, so A and C start
+    // out unreachable to each other while B is linked to both. Gossip (a
+    // bootstrap default) still tells A that C exists — but the offer it sends
+    // through the lobby goes nowhere, and the link stays unformed.
     await setup([
       ["a", "b"],
       ["b", "c"],
@@ -375,23 +336,25 @@ describe("brokered signalling over real WebRTC", () => {
     await waitPeers(a, 1)
     await waitPeers(b, 2)
     await waitPeers(c, 1)
-    expect(a.peerIds()).toEqual(["b"])
-    expect(b.peerIds().sort()).toEqual(["a", "c"])
-    expect(c.peerIds()).toEqual(["b"])
+    await waitLinked(a, 1)
+    await waitLinked(b, 2)
+    await waitLinked(c, 1)
+    const linked = <Msg>(kit: P2PKit<Msg>) => kit.linkedPeers().sort()
+    expect(linked(a)).toEqual(["b"])
+    expect(linked(b)).toEqual(["a", "c"])
+    expect(linked(c)).toEqual(["b"])
 
-    // The lobby goes away: from here on there is no room to announce into.
+    // The lobby goes away: from here on there is no room to signal through.
     await server.close()
     await settle(300)
 
-    // A is seeded with C's id out of band — in the mesh that is gossip's job
-    // (see the discovery tests). The offer can only travel over the A–B link,
-    // so B has to carry it.
+    // Nobody seeds A with C's id and nobody retries by hand: the broker drops
+    // to the relay path, the stalled offer is re-sent, and B carries it.
     const atC = new Promise<string>(resolve =>
       c.on("message", (msg, peer) => {
         if (peer.remote === "a") resolve(msg.body)
       }),
     )
-    a.connect("c")
     const deadline = Date.now() + 20000
     while ((!a.peers.get("c")?.connected || !c.peers.get("a")?.connected) && Date.now() < deadline) {
       await settle(100)

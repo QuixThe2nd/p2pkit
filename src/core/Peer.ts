@@ -1,7 +1,7 @@
 import type { PeerId } from "../utils/types.js"
 import type { Signer } from "../auth/signer.js"
 import type { Transport } from "../transports/types.js"
-import type { SignallingChannel } from "../signalling/types.js"
+import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Frame, MsgFrame, HelloFrame, AckFrame, ReqFrame, ResFrame } from "../wire/index.js"
 import { WIRE_VERSION, FrameCodec, validateFrame } from "../wire/index.js"
@@ -57,6 +57,8 @@ export interface PeerOptions<Msg = unknown> {
 
 const PING_INTERVAL_MS = 5000
 const DEFAULT_RPC_TIMEOUT = 30_000
+/** Signals buffered for a transport that has not subscribed yet (per remote). */
+const MAX_EARLY_SIGNALS = 64
 
 /**
  * One authenticated connection to a single peer. Wraps a {@link Transport} with
@@ -95,6 +97,15 @@ export class Peer<Msg = unknown> {
   >()
   private incoming = Promise.resolve()
 
+  // Signals that arrived before the transport subscribed. Building an
+  // RTCTransport is async (backend resolution), and a fast peer's offer can
+  // beat the subscription by a macrotask; without a buffer that offer is lost
+  // and the slot never connects. The buffer subscribes synchronously at
+  // construction and replays into the transport's own handler once it exists.
+  private readonly earlyHandlers = new Set<(message: SignallingMessage) => void>()
+  private readonly earlySignals: SignallingMessage[] = []
+  private readonly unsubscribeEarly?: () => void
+
   /** Resolves once the connection is open (identity proven) or rejects on failure. */
   readonly ready: Promise<void>
 
@@ -110,7 +121,20 @@ export class Peer<Msg = unknown> {
     // Keep `ready` "handled" so an unawaited connection failure never surfaces
     // as an unhandled rejection; a caller awaiting `ready` still sees the error.
     this.ready.catch(() => {})
+    if (options.signalling && !options.transport) {
+      const off = options.signalling.onMessage(message => this.routeEarlySignal(message)) as unknown
+      if (typeof off === "function") this.unsubscribeEarly = off as () => void
+    }
     void this.start()
+  }
+
+  /** Inbound signal before the transport exists: queue it; after: dispatch. */
+  private routeEarlySignal(message: SignallingMessage): void {
+    if (this.earlyHandlers.size === 0) {
+      if (this.earlySignals.length < MAX_EARLY_SIGNALS) this.earlySignals.push(message)
+      return
+    }
+    for (const handler of [...this.earlyHandlers]) handler(message)
   }
 
   /** The remote peer's id; cryptographically proven when `authenticated` is true. */
@@ -131,6 +155,18 @@ export class Peer<Msg = unknown> {
   /** Whether the connection is currently open. */
   get connected(): boolean {
     return this.open
+  }
+
+  /**
+   * Re-drive a handshake that never completed, because the signalling path it
+   * was negotiating over changed (the lobby dropped and signals now travel over
+   * peer links). No-op once open or closed, and for injected transports, which
+   * manage their own setup.
+   */
+  renegotiate(): void {
+    if (this.open || this.closed) return
+    const transport = this.transport
+    if (transport instanceof RTCTransport) transport.renegotiate()
   }
 
   on<E extends keyof PeerEvents<Msg>>(event: E, handler: PeerEvents<Msg>[E]): void {
@@ -202,6 +238,9 @@ export class Peer<Msg = unknown> {
     if (this.closed) return
     this.closed = true
     if (this.pingTimer) clearInterval(this.pingTimer)
+    this.unsubscribeEarly?.()
+    this.earlySignals.length = 0
+    this.earlyHandlers.clear()
     this.open = false
     this.sharedKey = undefined
     this.pendingPings.clear()
@@ -255,10 +294,24 @@ export class Peer<Msg = unknown> {
     if (!signalling)
       throw new Error("Peer requires a `signalling` channel (or an injected transport)")
     const backend = await getRTC(this.options.backend as RTCBackendSource | undefined)
+    // The transport sees this channel, not the raw one: signals that arrived
+    // while the backend was resolving replay into its handler on subscribe, so
+    // a fast peer's first offer is never lost to the construction gap.
+    const channel: SignallingChannel = {
+      ready: signalling.ready,
+      send: message => signalling.send(message),
+      onMessage: handler => {
+        this.earlyHandlers.add(handler)
+        for (const message of this.earlySignals.splice(0)) handler(message)
+        return () => {
+          this.earlyHandlers.delete(handler)
+        }
+      },
+    }
     return new RTCTransport<Frame>({
       self: this.self!,
       remote: this._remote,
-      signalling,
+      signalling: channel,
       backend,
       iceServers: this.options.iceServers,
       // Deterministic initiator: the lexicographically-smaller id offers, avoiding glare.

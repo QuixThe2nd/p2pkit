@@ -9,6 +9,7 @@ import type { Transport } from "../transports/types.js"
 import type { Frame, BcastFrame, SubFrame, PubFrame, GossipFrame } from "../wire/index.js"
 import { WIRE_VERSION } from "../wire/index.js"
 import type { Discovery, DiscoveryHost } from "../discovery/types.js"
+import { GossipDiscovery } from "../discovery/gossip.js"
 import { Emitter } from "../utils/emitter.js"
 import { randomId } from "../utils/id.js"
 import type { Router } from "../rpc/router.js"
@@ -40,6 +41,13 @@ export interface P2PKitOptions {
   /**
    * Bootstrap without building a signalling channel yourself (README §2). Give
    * this **or** `signalling`. Currently only the WebSocket lobby is built in.
+   *
+   * Unlike a hand-rolled `signalling` channel, the bootstrap path owns the
+   * whole peering stack: the lobby socket reconnects itself, peer-brokered
+   * signalling (README §4.1) keeps handshakes flowing while the lobby is
+   * unreachable, and gossip discovery learns the rest of the room from the
+   * peers you already have. Opt out with `brokeredSignalling: false`,
+   * `discovery: false`, or `signallingOptions.reconnect: false`.
    */
   bootstrap?: BootstrapSource
   /** Identity signer; enables verified handshakes, encryption and signed broadcasts. */
@@ -62,12 +70,19 @@ export interface P2PKitOptions {
   protocol?: AnyProtocol
   /** Per-call RPC timeout in ms. Default 30000. */
   rpcTimeout?: number
-  /** Discovery channels to grow/heal the mesh beyond the signalling room (README §4). */
-  discovery?: Discovery | Discovery[]
+  /**
+   * Discovery channels to grow/heal the mesh beyond the signalling room
+   * (README §4). On the `bootstrap` path a {@link GossipDiscovery} is composed
+   * in automatically; pass `false` to opt out, or your own channels to add to
+   * it. With a self-supplied `signalling` channel nothing is added — pass
+   * discovery explicitly there.
+   */
+  discovery?: Discovery | Discovery[] | false
   /**
    * Carry handshake signals over existing links when the signalling channel is
-   * unreachable (README §4). Default `false`; with it off, a dead lobby means no
-   * new connections.
+   * unreachable (README §4). Default `true` on the `bootstrap` path, `false`
+   * with a self-supplied `signalling` channel; with it off, a dead lobby means
+   * no new connections.
    */
   brokeredSignalling?: boolean
   /** Options for the lobby built by `bootstrap`. */
@@ -105,6 +120,15 @@ export type P2PKitEvents<Msg> = {
   error: (err: Error) => void
 }
 
+/**
+ * Where the signalling bootstrap stands, independent of any peer link:
+ * `connecting` until the lobby has answered or is known unreachable, `up`
+ * while the room is reachable, `down` once it has dropped (the mesh keeps
+ * working over peer links meanwhile; see README §4.1). A status event fires on
+ * every transition, reconnects included.
+ */
+export type BootstrapStatus = "connecting" | "up" | "down"
+
 const DEFAULT_TTL = 7
 const DEFAULT_DEDUP_WINDOW = 30_000
 const BROADCAST_FRESHNESS_MS = 60_000
@@ -138,6 +162,12 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
   private _self?: PeerId
   private started = false
 
+  // Signalling-bootstrap liveness, separate from peer link state: only defined
+  // while a broker exists to observe the channel (the bootstrap path always has
+  // one; a self-supplied channel reports through markSignallingUp/Down).
+  private bootstrapStatusValue?: BootstrapStatus
+  private readonly bootstrapStatusHandlers = new Set<(status: BootstrapStatus) => void>()
+
   // Broadcast dedup + signed-broadcast replay tracking.
   private readonly bcastSeen: SeenCache
   private readonly bcastNonces: SeenCache
@@ -162,18 +192,37 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     const source = options.bootstrap
     if (!options.signalling && source) {
       if (source.kind !== "lobby") throw new Error(`unsupported bootstrap kind: ${source.kind}`)
+      // The bootstrap lobby owns its own lifecycle: it reconnects with capped
+      // backoff, and each drop/open is what flips the kit between the lobby and
+      // the brokered relay path.
       lobby = new WebSocketSignalling(source.url, {
+        reconnect: {},
         ...options.signallingOptions,
-        onDown: () => broker?.markLobbyDown(),
+        onDown: () => {
+          options.signallingOptions?.onDown?.()
+          this.onLobbyDown()
+        },
+        onUp: () => {
+          options.signallingOptions?.onUp?.()
+          this.onLobbyUp()
+        },
       })
       this.lobby = lobby
     }
     const upstream = options.signalling ?? lobby
     if (!upstream) throw new Error("P2PKit requires `signalling` or a `bootstrap` source")
-    if (options.brokeredSignalling) {
+    // Brokered signalling is the bootstrap default; a self-supplied channel
+    // stays a pure pass-through unless it opts in.
+    if (options.brokeredSignalling ?? lobby !== undefined) {
       broker = new SignalBroker(upstream, this, options.brokerOptions)
       this.broker = broker
       this.signalling = broker
+      this.bootstrapStatusValue = "connecting"
+      // The first settle tells us whether the lobby ever answered; after that,
+      // transitions arrive through onLobbyUp/Down and markSignallingUp/Down.
+      broker.ready.then(() =>
+        this.setBootstrapStatus(broker!.lobbyAlive ? "up" : "down"),
+      )
     } else {
       this.signalling = upstream
     }
@@ -184,7 +233,10 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     this.subGossipSeen = new SeenCache(dedupWindow)
     this.pubDedup = new SeenCache(dedupWindow)
     const d = options.discovery
-    this.discoveries = d === undefined ? [] : Array.isArray(d) ? d : [d]
+    this.discoveries = d === undefined || d === false ? [] : Array.isArray(d) ? d : [d]
+    // Gossip is how the bootstrap mesh learns peers the lobby never named; a
+    // self-supplied channel composes nothing the caller did not ask for.
+    if (lobby && d !== false) this.discoveries.unshift(new GossipDiscovery())
   }
 
   get selfId(): PeerId {
@@ -286,7 +338,11 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
       void this.onMeshFrame(frame, peer).catch(err => this.reportError(err))
     })
     peer.on("connect", () => this.discoveryEvents.emit("peerConnected", peer.remote))
-    peer.on("disconnect", () => this.peers.delete(remote))
+    // A stale slot must not evict a fresh one: the map entry belongs to this
+    // peer only while it is still the object stored there.
+    peer.on("disconnect", () => {
+      if (this.peers.get(remote) === peer) this.peers.delete(remote)
+    })
     peer.on("error", err => this.emitter.emit("error", err))
     this.emitter.emit("peer", peer)
   }
@@ -336,12 +392,58 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
    * No-op without `brokeredSignalling`.
    */
   markSignallingDown(): void {
-    this.broker?.markLobbyDown()
+    if (this.broker) this.onLobbyDown()
   }
 
   /** Report the signalling channel reachable again (see {@link markSignallingDown}). */
   markSignallingUp(): void {
+    if (this.broker) this.onLobbyUp()
+  }
+
+  /**
+   * The signalling bootstrap's current state, or `undefined` when nothing
+   * observes the channel (a self-supplied channel with no broker). This is
+   * bootstrap diagnostics only — whether the mesh can pass traffic right now is
+   * a property of {@link peers}, never of this.
+   */
+  get bootstrapStatus(): BootstrapStatus | undefined {
+    return this.bootstrapStatusValue
+  }
+
+  /** Subscribe to bootstrap status transitions; the current value is in {@link bootstrapStatus}. */
+  onBootstrapStatus(handler: (status: BootstrapStatus) => void): () => void {
+    this.bootstrapStatusHandlers.add(handler)
+    return () => this.bootstrapStatusHandlers.delete(handler)
+  }
+
+  private setBootstrapStatus(status: BootstrapStatus): void {
+    if (this.bootstrapStatusValue === undefined || this.bootstrapStatusValue === status) return
+    this.bootstrapStatusValue = status
+    for (const handler of [...this.bootstrapStatusHandlers]) handler(status)
+  }
+
+  /**
+   * The lobby dropped: switch outbound signals to the relay path and re-offer
+   * every link still negotiating — an offer that went out while the lobby was
+   * up may have died with it, and the relay path is the only way it completes
+   * now.
+   */
+  private onLobbyDown(): void {
+    this.broker?.markLobbyDown()
+    this.setBootstrapStatus("down")
+    for (const peer of this.peers.values()) {
+      if (!peer.connected) peer.renegotiate()
+    }
+  }
+
+  /** The lobby is (back) reachable: pass signals through again and rejoin the room. */
+  private onLobbyUp(): void {
     this.broker?.markLobbyUp()
+    this.setBootstrapStatus("up")
+    // The room forgot us when the socket dropped; announce again so peers that
+    // arrived meanwhile learn we exist. Harmless on the first open — `start`
+    // announces too, and receivers dedup.
+    if (this.started && this._self) this.signalling.send({ announce: true, from: this._self })
   }
 
   /** Send one frame onto a direct link (satisfies {@link SignalBrokerHost}). */
