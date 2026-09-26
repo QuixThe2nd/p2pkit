@@ -436,6 +436,18 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     }
   }
 
+  /**
+   * Announce into the room again. `start` announces once, and a peer that hears
+   * an announce opens a slot only when it has none for that address — so a peer
+   * rejoining under an address a counterpart still holds a stale slot for is
+   * invisible to that counterpart, and if the slot then closes the peer has no
+   * way back: it cannot open a link by itself unless it is the one that offers.
+   * Announcing again is the way to be seen a second time. No-op before `start`.
+   */
+  announce(): void {
+    if (this.started && this._self) this.signalling.send({ announce: true, from: this._self })
+  }
+
   /** The lobby is (back) reachable: pass signals through again and rejoin the room. */
   private onLobbyUp(): void {
     this.broker?.markLobbyUp()
@@ -443,7 +455,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     // The room forgot us when the socket dropped; announce again so peers that
     // arrived meanwhile learn we exist. Harmless on the first open — `start`
     // announces too, and receivers dedup.
-    if (this.started && this._self) this.signalling.send({ announce: true, from: this._self })
+    this.announce()
   }
 
   /** Send one frame onto a direct link (satisfies {@link SignalBrokerHost}). */
