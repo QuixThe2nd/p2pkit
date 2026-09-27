@@ -103,16 +103,10 @@ export interface PubFrame {
    * seq resetting to 1 — is a fresh sequence space to still-running receivers
    * instead of a replay. Absent from older publishers, whose frames keep the
    * legacy per-(topic, from) tracking. On signed topics the incarnation is
-   * authenticated by `sessionSig`; the per-frame `sig` payload is unchanged,
-   * so older receivers verify these frames exactly as before.
+   * bound into the per-frame `sig` payload itself (see `pubSignPayload`), so a
+   * transplanted, mutated, or stripped session fails signature verification.
    */
   session?: string
-  /**
-   * Signature over `pubSessionPayload({ from, session })`, present together
-   * with `session` on signed publishes. Proves the claimed incarnation belongs
-   * to `from` without altering the per-frame signed payload.
-   */
-  sessionSig?: string
   /** Hop limit for flooding. */
   ttl: number
   body: unknown
@@ -331,8 +325,7 @@ export function validateFrame(value: unknown): asserts value is Frame {
         int("seq", 1) &&
         int("ttl", 1) &&
         sig &&
-        (f.session === undefined || str("session")) &&
-        (f.sessionSig === undefined || typeof f.sessionSig === "string")
+        (f.session === undefined || str("session"))
       break
     case "sub":
     case "unsub":
