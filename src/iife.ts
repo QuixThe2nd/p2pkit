@@ -26,6 +26,17 @@ export {
   type RTCDataChannelSendQueueOptions,
 } from "./transports/rtc-send-queue.js"
 export { DEFAULT_ICE_SERVERS } from "./utils/ice.js"
+// The client half of a door link: this is how a cold browser takes its first
+// peer. Only WSTransport is exported — DoorAcceptor listens, which no browser
+// needs, and it pulls in `ws` + `node:http`.
+export {
+  WSTransport,
+  DOOR_MIN_BACKOFF_MS,
+  DOOR_MAX_BACKOFF_MS,
+  type WSTransportOptions,
+  type DoorOptions,
+  type DoorSocket,
+} from "./transports/ws-door.js"
 export { extractIP } from "./utils/sdp.js"
 export { Emitter } from "./utils/emitter.js"
 export { randomId } from "./utils/id.js"

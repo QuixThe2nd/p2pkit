@@ -1218,6 +1218,392 @@ var P2PKIT_IIFE = (function (exports) {
     }
   };
 
+  // src/wire/index.ts
+  var WIRE_VERSION = 2;
+  var WireError = class extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "WireError";
+    }
+  };
+  var KINDS = /* @__PURE__ */ new Set([
+    "sealed",
+    "hello",
+    "ack",
+    "msg",
+    "req",
+    "res",
+    "bcast",
+    "sub",
+    "unsub",
+    "pub",
+    "gossip",
+    "welcome",
+    "sig-relay",
+    "chunk",
+    "ping",
+    "pong"
+  ]);
+  var FrameCodec = {
+    encode(frame) {
+      return JSON.stringify(frame);
+    },
+    decode(raw) {
+      let obj;
+      try {
+        obj = JSON.parse(raw);
+      } catch {
+        throw new WireError("frame is not valid JSON");
+      }
+      if (typeof obj !== "object" || obj === null) throw new WireError("frame is not an object");
+      const rec = obj;
+      if (rec["v"] !== WIRE_VERSION)
+        throw new WireError(`unsupported wire version: ${String(rec["v"])}`);
+      if (typeof rec["k"] !== "string" || !KINDS.has(rec["k"])) {
+        throw new WireError(`unknown frame kind: ${String(rec["k"])}`);
+      }
+      validateFrame(obj);
+      return obj;
+    }
+  };
+  function validateFrame(value) {
+    if (!value || typeof value !== "object") throw new WireError("frame is not an object");
+    const f = value;
+    if (f.v !== WIRE_VERSION) throw new WireError("unsupported wire version");
+    const str = (key) => typeof f[key] === "string" && f[key].length > 0;
+    const int = (key, min = 0) => Number.isSafeInteger(f[key]) && f[key] >= min;
+    const sig = f.sig === void 0 || typeof f.sig === "string";
+    let valid = false;
+    switch (f.k) {
+      case "hello":
+        valid = str("from") && str("nonce") && Array.isArray(f.caps) && f.caps.every((x) => typeof x === "string") && sig;
+        break;
+      case "ack":
+        valid = str("from") && str("nonce") && sig;
+        break;
+      case "sealed":
+        valid = str("body");
+        break;
+      case "msg":
+        valid = f.enc === void 0;
+        break;
+      case "req":
+        valid = str("id") && str("method");
+        break;
+      case "res": {
+        const err = f.err;
+        valid = str("id") && typeof f.ok === "boolean" && (f.ok || !!err && typeof err.code === "string" && typeof err.method === "string" && (err.message === void 0 || typeof err.message === "string"));
+        break;
+      }
+      case "bcast":
+        valid = str("id") && str("from") && int("ttl", 1) && sig && (f.ts === void 0 || int("ts")) && (f.nonce === void 0 || str("nonce"));
+        break;
+      case "pub":
+        valid = str("topic") && str("from") && str("nonce") && int("seq", 1) && int("ttl", 1) && sig;
+        break;
+      case "sub":
+      case "unsub":
+        valid = str("topic") && str("from") && str("id");
+        break;
+      case "gossip":
+        valid = Array.isArray(f.peers) && f.peers.every((x) => typeof x === "string" && x.length > 0);
+        break;
+      case "welcome":
+        valid = str("from") && Array.isArray(f.caps) && f.caps.every((x) => typeof x === "string");
+        break;
+      case "chunk":
+        valid = str("id") && int("i") && int("n", 1) && f.i < f.n && typeof f.part === "string";
+        break;
+      case "sig-relay": {
+        const signal = f.signal;
+        const carried = !!signal && typeof signal === "object" && typeof signal["from"] === "string" && (signal["announce"] === true || typeof signal["description"] === "object" && signal["description"] !== null || typeof signal["iceCandidate"] === "object" && signal["iceCandidate"] !== null);
+        valid = str("id") && str("from") && str("to") && int("ttl") && carried;
+        break;
+      }
+      case "ping":
+      case "pong":
+        valid = str("id");
+        break;
+    }
+    if (!valid) throw new WireError("invalid frame shape");
+  }
+
+  // src/transports/ws-door.ts
+  var OPEN = 1;
+  var DEFAULT_KEEPALIVE_MS = 15e3;
+  var DEFAULT_KEEPALIVE_TIMEOUT_MS = 1e4;
+  var DEFAULT_IDENTIFY_TIMEOUT_MS = 1e4;
+  var DEFAULT_MAX_BUFFERED = 256;
+  var DEFAULT_CAPS = ["ws"];
+  async function loadWs() {
+    const spec = "ws";
+    return (await import(
+      /* @vite-ignore */
+      spec
+    )).default;
+  }
+  var DOOR_MIN_BACKOFF_MS = 500;
+  var DOOR_MAX_BACKOFF_MS = 15e3;
+  var WSTransport = class _WSTransport {
+    name = "ws";
+    /**
+     * Resolves with the counterpart's id once its `welcome` arrives, and rejects
+     * if the socket dies first. The door side needs this before it can key the
+     * link; {@link WSTransport.open} awaits it so callers get a usable transport.
+     */
+    identified;
+    emitter = new Emitter();
+    options;
+    socket;
+    _remote;
+    open = false;
+    closed = false;
+    welcomed = false;
+    /** Frames that arrived before a `message` handler registered. */
+    buffered = [];
+    hasConsumer = false;
+    keepAliveTimer;
+    keepAliveWatchdog;
+    identifyTimer;
+    resolveIdentified;
+    rejectIdentified;
+    constructor(options) {
+      this.options = options;
+      let resolve;
+      let reject;
+      this.identified = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      this.identified.catch(() => {
+      });
+      this.resolveIdentified = resolve;
+      this.rejectIdentified = reject;
+      this.identifyTimer = setTimeout(() => {
+        this.identifyTimer = void 0;
+        if (!this.welcomed) this.fail(new Error("door link never identified itself"));
+      }, options.identifyTimeoutMs ?? DEFAULT_IDENTIFY_TIMEOUT_MS);
+      this.unref(this.identifyTimer);
+      if (options.socket) this.attach(options.socket);
+      else void this.dial();
+    }
+    /** The peer on the other end. Unavailable before its `welcome` arrived. */
+    get remote() {
+      if (this._remote === void 0) throw new Error("door link has not identified itself yet");
+      return this._remote;
+    }
+    /** The counterpart's id, or `undefined` before its `welcome` arrived. */
+    get identifiedPeer() {
+      return this._remote;
+    }
+    get bufferedAmount() {
+      return this.socket?.bufferedAmount ?? 0;
+    }
+    /** True once the welcome exchange completed and the socket is still up. */
+    get connected() {
+      return this.open && !this.closed;
+    }
+    /**
+     * Build a transport that is already identified — the shape a kit needs before
+     * it can key a peer. Rejects if the door never answers.
+     */
+    static async open(options) {
+      const transport = new _WSTransport(options);
+      await transport.identified;
+      return transport;
+    }
+    on(event, handler) {
+      this.emitter.on(event, handler);
+      if (event === "message") {
+        this.hasConsumer = true;
+        for (const frame of this.buffered.splice(0)) this.emitter.emit("message", frame);
+      } else if (event === "connect" && this.connected) {
+        queueMicrotask(() => handler());
+      } else if (event === "disconnect" && this.closed) {
+        queueMicrotask(() => handler());
+      }
+    }
+    async send(frame) {
+      const socket = this.socket;
+      if (this.closed || !this.open || !socket || socket.readyState !== OPEN) {
+        throw new Error("door link is not open");
+      }
+      socket.send(FrameCodec.encode(frame));
+    }
+    /** Close the socket. Idempotent. */
+    disconnect() {
+      if (this.closed) return;
+      this.closed = true;
+      this.stopTimers();
+      const socket = this.socket;
+      this.socket = void 0;
+      try {
+        socket?.close();
+      } catch {
+      }
+      if (this.open) {
+        this.open = false;
+        this.emitter.emit("disconnect");
+      } else {
+        this.rejectIdentified(new Error("door link closed before it opened"));
+      }
+      this.emitter.removeAll();
+    }
+    // ---- wiring -----------------------------------------------------------
+    async dial() {
+      const WS = this.options.WebSocket ?? globalThis.WebSocket ?? await loadWs();
+      if (this.closed) return;
+      try {
+        this.attach(new WS(this.options.url));
+      } catch (err) {
+        this.fail(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+    /** Take ownership of a socket; dialing and accepting meet here. */
+    attach(socket) {
+      if (this.closed) {
+        try {
+          socket.close();
+        } catch {
+        }
+        return;
+      }
+      this.socket = socket;
+      let stale = false;
+      const mine = () => !stale && !this.closed && this.socket === socket;
+      const goDown = (err) => {
+        if (stale || this.closed || this.socket !== socket) return;
+        stale = true;
+        if (err !== void 0) {
+          this.emitter.emit("error", err instanceof Error ? err : new Error(String(err)));
+        }
+        this.fail(new Error("door socket closed"));
+      };
+      socket.onopen = () => {
+        if (!mine()) return;
+        this.open = true;
+        this.sendWelcome();
+        this.startKeepalive();
+      };
+      socket.onmessage = ({ data }) => {
+        if (!mine()) return;
+        this.noteActivity();
+        const raw = typeof data === "string" ? data : String(data);
+        let frame;
+        try {
+          frame = FrameCodec.decode(raw);
+        } catch {
+          return;
+        }
+        this.onFrame(frame);
+      };
+      socket.onerror = (err) => goDown(err);
+      socket.onclose = () => goDown();
+      this.options.onPong?.(() => {
+        if (mine()) this.noteActivity();
+      });
+      if (socket.readyState === OPEN && !this.open) {
+        this.open = true;
+        this.sendWelcome();
+        this.startKeepalive();
+      }
+    }
+    sendWelcome() {
+      const frame = {
+        v: WIRE_VERSION,
+        k: "welcome",
+        from: this.options.self,
+        caps: this.options.caps ?? DEFAULT_CAPS
+      };
+      try {
+        this.socket?.send(FrameCodec.encode(frame));
+      } catch (err) {
+        this.fail(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+    onFrame(frame) {
+      if (frame.k === "welcome") {
+        if (this.welcomed) return;
+        this.welcomed = true;
+        if (this.identifyTimer !== void 0) {
+          clearTimeout(this.identifyTimer);
+          this.identifyTimer = void 0;
+        }
+        this._remote = frame.from;
+        this.resolveIdentified(frame.from);
+        this.emitter.emit("connect");
+        return;
+      }
+      if (!this.welcomed) return;
+      if (!this.hasConsumer) {
+        const max = this.options.maxBuffered ?? DEFAULT_MAX_BUFFERED;
+        if (this.buffered.length >= max) this.buffered.shift();
+        this.buffered.push(frame);
+        return;
+      }
+      this.emitter.emit("message", frame);
+    }
+    // ---- keepalive --------------------------------------------------------
+    // A socket whose counterpart vanished without a close frame stays half open
+    // forever; a WS-level ping is the only probe that crosses it. Sockets without
+    // `ping()` (browsers) cannot probe, and there they lean on the mesh's own 5s
+    // ping/pong traffic to notice a dead link.
+    startKeepalive() {
+      const interval = this.options.keepAliveMs ?? DEFAULT_KEEPALIVE_MS;
+      if (interval <= 0 || typeof this.socket?.ping !== "function") return;
+      this.keepAliveTimer = setInterval(() => {
+        if (!this.closed) this.probe();
+      }, interval);
+      this.unref(this.keepAliveTimer);
+      this.probe();
+    }
+    probe() {
+      try {
+        this.socket?.ping?.();
+      } catch {
+        return;
+      }
+      const timeout = this.options.keepAliveTimeoutMs ?? DEFAULT_KEEPALIVE_TIMEOUT_MS;
+      if (this.keepAliveWatchdog !== void 0) clearTimeout(this.keepAliveWatchdog);
+      this.keepAliveWatchdog = setTimeout(() => {
+        if (this.open && !this.closed) this.fail(new Error("door link went quiet"));
+      }, timeout);
+      this.unref(this.keepAliveWatchdog);
+    }
+    noteActivity() {
+      if (this.keepAliveWatchdog !== void 0) {
+        clearTimeout(this.keepAliveWatchdog);
+        this.keepAliveWatchdog = void 0;
+      }
+    }
+    stopTimers() {
+      if (this.keepAliveTimer !== void 0) {
+        clearInterval(this.keepAliveTimer);
+        this.keepAliveTimer = void 0;
+      }
+      if (this.keepAliveWatchdog !== void 0) {
+        clearTimeout(this.keepAliveWatchdog);
+        this.keepAliveWatchdog = void 0;
+      }
+      if (this.identifyTimer !== void 0) {
+        clearTimeout(this.identifyTimer);
+        this.identifyTimer = void 0;
+      }
+    }
+    /** Report a failure, then tear the link down. The rejection wins over the
+     * generic one `disconnect` would raise, so a caller awaiting `identified`
+     * learns what actually went wrong. */
+    fail(err) {
+      this.rejectIdentified(err);
+      this.disconnect();
+    }
+    unref(timer) {
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        timer.unref();
+      }
+    }
+  };
+
   // src/utils/sdp.ts
   function extractIP(sdp) {
     for (const raw of sdp.split(/\r?\n/)) {
@@ -1231,11 +1617,14 @@ var P2PKIT_IIFE = (function (exports) {
 
   exports.DEFAULT_ICE_SERVERS = DEFAULT_ICE_SERVERS;
   exports.DEFAULT_TRANSPORT_ORDER = DEFAULT_TRANSPORT_ORDER;
+  exports.DOOR_MAX_BACKOFF_MS = DOOR_MAX_BACKOFF_MS;
+  exports.DOOR_MIN_BACKOFF_MS = DOOR_MIN_BACKOFF_MS;
   exports.Emitter = Emitter;
   exports.RTCDataChannelSendQueue = RTCDataChannelSendQueue;
   exports.RTCTransport = RTCTransport;
   exports.RTCTransportConnectTimeoutError = RTCTransportConnectTimeoutError;
   exports.RTC_SEND_QUEUE_FLUSH_THRESHOLD = RTC_SEND_QUEUE_FLUSH_THRESHOLD;
+  exports.WSTransport = WSTransport;
   exports.capsFor = capsFor;
   exports.chooseTransport = chooseTransport;
   exports.directIceServers = directIceServers;
