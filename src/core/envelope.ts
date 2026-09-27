@@ -28,6 +28,16 @@ export function pubSignPayload(f: {
 }
 
 /**
+ * Deterministic string a publisher signs ONCE per kit incarnation to
+ * authenticate its {@link PubFrame.session} on signed topics. Kept separate
+ * from {@link pubSignPayload} so the per-frame signed payload — and with it
+ * verification by receivers that predate incarnations — is unchanged.
+ */
+export function pubSessionPayload(f: { from: PeerId; session: string }): string {
+  return JSON.stringify(["pub-session", f.from, f.session])
+}
+
+/**
  * Time-bounded set of seen ids, for broadcast/publish dedup and nonce replay
  * protection. Entries expire after `windowMs`.
  */

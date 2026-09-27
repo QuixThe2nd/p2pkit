@@ -92,10 +92,27 @@ export interface PubFrame {
   k: "pub"
   topic: string
   from: PeerId
-  /** Per-sender monotonically increasing sequence number (also the relay dedup key). */
+  /** Per-sender, per-incarnation monotonically increasing sequence number (also the relay dedup key). */
   seq: number
   /** Per-message nonce within the replay window. */
   nonce: string
+  /**
+   * Publisher incarnation: a random id generated once per kit start, present on
+   * every publish from runtimes new enough to send it. Replay state is tracked
+   * per (topic, from, session), so a sender that restarts with the same key —
+   * seq resetting to 1 — is a fresh sequence space to still-running receivers
+   * instead of a replay. Absent from older publishers, whose frames keep the
+   * legacy per-(topic, from) tracking. On signed topics the incarnation is
+   * authenticated by `sessionSig`; the per-frame `sig` payload is unchanged,
+   * so older receivers verify these frames exactly as before.
+   */
+  session?: string
+  /**
+   * Signature over `pubSessionPayload({ from, session })`, present together
+   * with `session` on signed publishes. Proves the claimed incarnation belongs
+   * to `from` without altering the per-frame signed payload.
+   */
+  sessionSig?: string
   /** Hop limit for flooding. */
   ttl: number
   body: unknown
@@ -307,7 +324,15 @@ export function validateFrame(value: unknown): asserts value is Frame {
         (f.nonce === undefined || str("nonce"))
       break
     case "pub":
-      valid = str("topic") && str("from") && str("nonce") && int("seq", 1) && int("ttl", 1) && sig
+      valid =
+        str("topic") &&
+        str("from") &&
+        str("nonce") &&
+        int("seq", 1) &&
+        int("ttl", 1) &&
+        sig &&
+        (f.session === undefined || str("session")) &&
+        (f.sessionSig === undefined || typeof f.sessionSig === "string")
       break
     case "sub":
     case "unsub":

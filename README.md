@@ -193,7 +193,9 @@ Topic generics provide TypeScript types only. Topic schema validation is planned
 
 ### Replay protection
 
-Each publish carries a positive integer sequence and nonce. Receivers remember accepted sequence numbers within a 1024-sequence window for each topic/sender and reject duplicates and stale sequences for the lifetime of that node. Replay state is in memory, so it resets when the node is recreated; this is not a durable freshness guarantee. Unsigned origins can be spoofed.
+Each publish carries a positive integer sequence and nonce. Receivers remember accepted sequence numbers within a 1024-sequence window per topic/sender/incarnation and reject duplicates and stale sequences for the lifetime of that node. Replay state is in memory, so it resets when the node is recreated; this is not a durable freshness guarantee. Unsigned origins can be spoofed.
+
+A publish also carries a **publisher incarnation** (`session`): a random id each kit generates at `start()`, authenticated on signed topics by a one-time signature (`sessionSig`) that travels alongside the unchanged per-frame signature. Sequence state is tracked per incarnation, so a sender that restarts with the same key — its sequence resetting to 1 — opens a fresh sequence space on still-running receivers instead of being rejected as a replay, and two live instances sharing one key deliver independently. Wire compatibility is additive: publishes from older (session-less) versions verify and dedup exactly as before under the legacy per-topic/sender space; receivers that already know an origin's incarnation drop session-less frames from that origin, so stripping the field cannot reopen the legacy space for duplicates. Receivers bound incarnation state per origin (16 most-recently-active; least-recently-active evicted) — eviction narrows the replay horizon for that incarnation only, the same horizon a receiver restart implies.
 
 Use `signed: true` with a verifying signer to sign outgoing publishes and **require verified signatures on incoming publishes** before delivery or relay:
 
