@@ -652,6 +652,8 @@ var P2PKIT_IIFE = (function (exports) {
   var RTCTransport = class {
     remote;
     name = "rtc";
+    /** An ICE-negotiated data channel has no handshake role to report. */
+    info = { scheme: "rtc" };
     self;
     signalling;
     emitter = new Emitter();
@@ -1342,10 +1344,22 @@ var P2PKIT_IIFE = (function (exports) {
       spec
     )).default;
   }
+  function schemeOf(url) {
+    if (url === void 0) return "ws";
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url.trim())?.[1];
+    return scheme === void 0 || scheme === "" ? "ws" : scheme.toLowerCase();
+  }
   var DOOR_MIN_BACKOFF_MS = 500;
   var DOOR_MAX_BACKOFF_MS = 15e3;
   var WSTransport = class _WSTransport {
     name = "ws";
+    /**
+     * The local end of this link: which scheme carries it here, and whether this
+     * side dialled or accepted. Fixed at construction, because both facts are
+     * settled the moment the socket exists — the welcome exchange that follows
+     * changes nothing about how the frames are being carried.
+     */
+    info;
     /**
      * Resolves with the counterpart's id once its `welcome` arrives, and rejects
      * if the socket dies first. The door side needs this before it can key the
@@ -1369,6 +1383,10 @@ var P2PKIT_IIFE = (function (exports) {
     rejectIdentified;
     constructor(options) {
       this.options = options;
+      this.info = {
+        scheme: options.scheme ?? schemeOf(options.url),
+        role: options.socket !== void 0 ? "server" : "client"
+      };
       let resolve;
       let reject;
       this.identified = new Promise((res, rej) => {
