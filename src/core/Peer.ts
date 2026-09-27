@@ -1,6 +1,6 @@
 import type { PeerId } from "../utils/types.js"
 import type { Signer } from "../auth/signer.js"
-import type { Transport } from "../transports/types.js"
+import type { Transport, TransportInfo } from "../transports/types.js"
 import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Frame, MsgFrame, HelloFrame, AckFrame, ReqFrame, ResFrame } from "../wire/index.js"
@@ -74,7 +74,12 @@ export class Peer<Msg = unknown> {
   private self?: PeerId
   private _remote: PeerId
   private transport?: Transport<Frame>
-  private _transportName = "rtc"
+  /**
+   * `"unknown"` until a transport exists. Claiming `"rtc"` here would assert a
+   * WebRTC link that may never be built — the link might turn out to be a
+   * dialled or accepted WebSocket, or nothing at all.
+   */
+  private _transportName = "unknown"
 
   private readonly selfNonce = randomId(16)
   private open = false
@@ -142,9 +147,24 @@ export class Peer<Msg = unknown> {
     return this._remote
   }
 
-  /** Name of the active transport, e.g. `"rtc"`. */
+  /** Name of the active transport, e.g. `"rtc"`. `"unknown"` before one exists. */
   get transportName(): string {
     return this._transportName
+  }
+
+  /**
+   * How this side's end of the link is actually carried, read off the local
+   * transport alone — never off anything the remote claimed, and never off the
+   * options this peer was built with. `undefined` while no transport exists,
+   * which is the honest word for a link still being built (or one that never
+   * got as far as having a carriage); a custom transport with nothing truthful
+   * to say about itself also leaves this `undefined` rather than guess.
+   */
+  get transportInfo(): TransportInfo | undefined {
+    const transport = this.transport as { name?: string; info?: TransportInfo } | undefined
+    if (transport === undefined) return undefined
+    if (transport.info !== undefined) return transport.info
+    return transport.name === undefined ? undefined : { scheme: transport.name }
   }
 
   /** Last measured round-trip latency in milliseconds, or `undefined` before the first probe. */
