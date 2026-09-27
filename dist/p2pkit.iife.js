@@ -1301,7 +1301,7 @@ var P2PKIT_IIFE = (function (exports) {
         valid = str("id") && str("from") && int("ttl", 1) && sig && (f.ts === void 0 || int("ts")) && (f.nonce === void 0 || str("nonce"));
         break;
       case "pub":
-        valid = str("topic") && str("from") && str("nonce") && int("seq", 1) && int("ttl", 1) && sig;
+        valid = str("topic") && str("from") && str("nonce") && int("seq", 1) && int("ttl", 1) && sig && (f.session === void 0 || str("session"));
         break;
       case "sub":
       case "unsub":
