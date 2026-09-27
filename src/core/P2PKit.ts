@@ -142,6 +142,27 @@ const DEFAULT_TTL = 7
 const DEFAULT_DEDUP_WINDOW = 30_000
 const BROADCAST_FRESHNESS_MS = 60_000
 const REPLAY_WINDOW = 1024
+/**
+ * How many publisher incarnations (sessions) are tracked per (topic, origin).
+ * Each restart of a publisher is a new incarnation; the bound keeps a publisher
+ * that restarts endlessly from growing receiver state without limit. Evicting
+ * the least-recently-active incarnation narrows the replay horizon for THAT
+ * incarnation only: its already-delivered frames could be accepted again. That
+ * is the documented bound — the same horizon a receiver restart implies — and
+ * never weakens duplicate/sequence checks for any incarnation still tracked.
+ */
+const MAX_PUB_SESSIONS_PER_ORIGIN = 16
+/**
+ * How many distinct (topic, origin) pairs replay state is tracked for, across
+ * the whole kit. Each origin group holds at most
+ * {@link MAX_PUB_SESSIONS_PER_ORIGIN} incarnation windows of at most
+ * {@link REPLAY_WINDOW} sequence numbers, so receiver-side replay memory is
+ * bounded regardless of how many origins or topics the mesh carries. Evicting
+ * the least-recently-active origin group drops every incarnation window for
+ * that origin — again the same horizon a receiver restart implies, never a
+ * weakening of checks for any origin still tracked.
+ */
+const MAX_PUB_REPLAY_ORIGINS = 1024
 
 /**
  * A signalling channel that is permanently unreachable. A door kit has no lobby
@@ -211,8 +232,18 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
   private readonly pubDedup: SeenCache
   private readonly topicSubs = new Map<string, Map<PeerId, number>>()
   private readonly pubSeq = new Map<string, number>()
-  private readonly pubReceived = new Map<string, Set<number>>()
-  private readonly pubHighest = new Map<string, number>()
+  // Publish replay state, tracked per publisher INCARNATION:
+  // [topic, from, session] -> highest seq + received window. A publisher that
+  // restarts with the same key starts a new incarnation (fresh session id), so
+  // its seq resetting to 1 opens a fresh sequence space on still-running
+  // receivers instead of being rejected as a replay of the old incarnation.
+  // Frames with no session (older publishers) share the legacy "" incarnation.
+  private readonly pubReplay = new Map<string, { highest: number; received: Set<number>; touched: number }>()
+  /** [topic, from] -> its incarnation state keys + last activity (for bounding). */
+  private readonly pubReplayOrigins = new Map<string, { sessions: Set<string>; touched: number }>()
+  private pubReplayTick = 0
+  /** This kit's own incarnation id, generated fresh at every start(). */
+  private pubSession?: string
 
   constructor(options: P2PKitOptions) {
     this.options = options
@@ -320,6 +351,10 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     await (this.signer as { ready?: Promise<void> } | undefined)?.ready
     this._self = this.signer?.id ?? this.options.self
     if (!this._self) throw new Error("P2PKit requires `self` or a `signer`")
+    // A fresh publisher incarnation per start: on signed topics it is bound
+    // into every per-frame signature (pubSignPayload), so the incarnation is
+    // authenticated by the same signature that authenticates the frame.
+    this.pubSession = randomId(16)
     if (this.options.signedBroadcasts && (!this.signer || this.signer instanceof NoopSigner)) {
       throw new Error("`signedBroadcasts` requires a `signer`")
     }
@@ -731,6 +766,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     const seq = (this.pubSeq.get(topic) ?? 0) + 1
     this.pubSeq.set(topic, seq)
     const nonce = randomId(8)
+    const session = this.pubSession
     let frame: PubFrame = {
       v: WIRE_VERSION,
       k: "pub",
@@ -740,14 +776,18 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
       nonce,
       ttl: this.ttl,
       body,
+      ...(session ? { session } : {}),
     }
     if (signed && this.signer) {
+      // The incarnation is part of the signed payload: this signature binds
+      // topic, origin, seq, nonce, body AND session as one unit, so no
+      // carrier can transplant the frame onto another incarnation.
       const sig = await this.signer.sign(
-        pubSignPayload({ topic, from: this.selfId, seq, nonce, body }),
+        pubSignPayload({ topic, from: this.selfId, seq, nonce, body, session }),
       )
       frame = { ...frame, sig }
     }
-    this.pubDedup.seen(JSON.stringify([topic, this.selfId, seq]))
+    this.pubDedup.seen(JSON.stringify([topic, this.selfId, session ?? "", seq]))
     // Publishes do not echo to the local publisher.
     this.sendToAll(frame)
   }
@@ -810,18 +850,33 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     }
     if (topic?.signed && !originVerified) return
 
+    // Incarnation integrity. On signed frames the session is inside the
+    // signed payload (pubSignPayload), so a transplanted, mutated, or
+    // stripped session already failed verification above — at every hop that
+    // verifies the frame, not only at subscribers, so a strip/replay cannot
+    // poison relay dedup ahead of the authentic frame. One residual case
+    // remains: a GENUINE pre-incarnation frame (signed over the legacy
+    // session-less tuple by this origin before its upgrade) verifies fine on
+    // its own. Once any incarnation is known for this origin on this topic,
+    // such session-less frames are dropped — otherwise replaying them would
+    // reopen the legacy sequence space and duplicate deliveries. Legacy
+    // frames stay acceptable for origins that have only ever published
+    // without a session: old publishers keep working with their
+    // pre-incarnation replay semantics.
+    const originKey = JSON.stringify([frame.topic, frame.from])
+    if (frame.session === undefined && frame.sig !== undefined && this.hasIncarnationState(originKey)) {
+      return
+    }
+
     // No replay state is touched until policy and authenticity checks pass.
-    const dedupKey = JSON.stringify([frame.topic, frame.from, frame.seq])
-    const highestKey = JSON.stringify([frame.topic, frame.from])
-    const highest = this.pubHighest.get(highestKey) ?? 0
-    const received = this.pubReceived.get(highestKey) ?? new Set<number>()
-    if (frame.seq <= highest - REPLAY_WINDOW || received.has(frame.seq)) return
+    const session = frame.session ?? ""
+    const dedupKey = JSON.stringify([frame.topic, frame.from, session, frame.seq])
+    const state = this.replayState(originKey, session)
+    if (frame.seq <= state.highest - REPLAY_WINDOW || state.received.has(frame.seq)) return
     if (this.pubDedup.seen(dedupKey)) return
-    const nextHighest = Math.max(highest, frame.seq)
-    this.pubHighest.set(highestKey, nextHighest)
-    received.add(frame.seq)
-    for (const seq of received) if (seq <= nextHighest - REPLAY_WINDOW) received.delete(seq)
-    this.pubReceived.set(highestKey, received)
+    state.highest = Math.max(state.highest, frame.seq)
+    state.received.add(frame.seq)
+    for (const seq of state.received) if (seq <= state.highest - REPLAY_WINDOW) state.received.delete(seq)
 
     if (topic)
       topic.deliver(frame.body, frame.from, {
@@ -830,5 +885,79 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
         originVerified,
       })
     if (frame.ttl > 1) this.sendToAll({ ...frame, ttl: frame.ttl - 1 }, from)
+  }
+
+  /** True when any non-legacy incarnation state exists for this origin+topic. */
+  private hasIncarnationState(originKey: string): boolean {
+    const origin = this.pubReplayOrigins.get(originKey)
+    if (!origin) return false
+    for (const key of origin.sessions) if (!key.endsWith(',""]')) return true
+    return false
+  }
+
+  /**
+   * The replay window for one incarnation of one origin on one topic, created
+   * on first use. Bounded twice: per origin
+   * ({@link MAX_PUB_SESSIONS_PER_ORIGIN} incarnations) and across the kit
+   * ({@link MAX_PUB_REPLAY_ORIGINS} origin groups), least-recently-active
+   * evicted in both. The just-created state is never an eviction candidate:
+   * it is touched before either scan runs, and the scans skip it explicitly.
+   */
+  private replayState(originKey: string, session: string): {
+    highest: number
+    received: Set<number>
+    touched: number
+  } {
+    const stateKey = JSON.stringify([...JSON.parse(originKey) as string[], session])
+    let origin = this.pubReplayOrigins.get(originKey)
+    let state = this.pubReplay.get(stateKey)
+    if (!state) {
+      state = { highest: 0, received: new Set(), touched: ++this.pubReplayTick }
+      this.pubReplay.set(stateKey, state)
+      if (!origin) {
+        this.pubReplayOrigins.set(originKey, (origin = { sessions: new Set(), touched: state.touched }))
+      }
+      origin.touched = state.touched
+      origin.sessions.add(stateKey)
+      if (origin.sessions.size > MAX_PUB_SESSIONS_PER_ORIGIN) {
+        // Evict the least-recently-active OTHER incarnation of this origin.
+        let oldestKey: string | undefined
+        let oldestTouched = Infinity
+        for (const key of origin.sessions) {
+          if (key === stateKey) continue
+          const s = this.pubReplay.get(key)
+          if (s && s.touched < oldestTouched) {
+            oldestTouched = s.touched
+            oldestKey = key
+          }
+        }
+        if (oldestKey) {
+          origin.sessions.delete(oldestKey)
+          this.pubReplay.delete(oldestKey)
+        }
+      }
+      if (this.pubReplayOrigins.size > MAX_PUB_REPLAY_ORIGINS) {
+        // Evict the least-recently-active OTHER origin group, with every
+        // incarnation window it holds.
+        let oldestOrigin: string | undefined
+        let oldestTouched = Infinity
+        for (const [key, o] of this.pubReplayOrigins) {
+          if (key === originKey) continue
+          if (o.touched < oldestTouched) {
+            oldestTouched = o.touched
+            oldestOrigin = key
+          }
+        }
+        if (oldestOrigin) {
+          const evicted = this.pubReplayOrigins.get(oldestOrigin)
+          if (evicted) for (const key of evicted.sessions) this.pubReplay.delete(key)
+          this.pubReplayOrigins.delete(oldestOrigin)
+        }
+      }
+      return state
+    }
+    state.touched = ++this.pubReplayTick
+    if (origin) origin.touched = state.touched
+    return state
   }
 }

@@ -16,15 +16,32 @@ export function broadcastSignPayload(f: {
   return JSON.stringify(["bcast", f.from, f.id, f.ts, f.nonce, f.body])
 }
 
-/** Deterministic string signed over a topic publish on `{ signed: true }` topics. */
+/**
+ * Deterministic string signed over a topic publish on `{ signed: true }`
+ * topics. When the frame carries a publisher incarnation (`session`) it is the
+ * seventh tuple element, so the signature binds the frame to that exact
+ * incarnation: a carrier cannot transplant a captured frame (sig, body, seq,
+ * nonce) onto another genuine session of the same author, mutate the session,
+ * or strip it, without invalidating the signature. Session-less frames sign
+ * the original six-element tuple byte-for-byte, so pre-incarnation publishers
+ * keep verifying on current receivers exactly as before. The converse is NOT
+ * held: a session-bearing signature never verifies against the legacy tuple,
+ * so receivers older than incarnations reject new signed publishes — on
+ * signed topics, upgrade receivers before (or with) publishers.
+ */
 export function pubSignPayload(f: {
   topic: string
   from: PeerId
   seq: number
   nonce: string
   body: unknown
+  session?: string
 }): string {
-  return JSON.stringify(["pub", f.topic, f.from, f.seq, f.nonce, f.body])
+  return JSON.stringify(
+    f.session === undefined
+      ? ["pub", f.topic, f.from, f.seq, f.nonce, f.body]
+      : ["pub", f.topic, f.from, f.seq, f.nonce, f.body, f.session],
+  )
 }
 
 /**
