@@ -103,6 +103,20 @@ export interface PubFrame {
   sig?: string
 }
 
+/**
+ * Door identity exchange. The very first frame either side of a
+ * {@link ../transports/ws-door} link sends: it names the sender so the link can
+ * be keyed before any peer handshake runs. Unlike every other frame it is not
+ * forwarded — a peer that did not open the socket never sees one.
+ */
+export interface WelcomeFrame {
+  v: typeof WIRE_VERSION
+  k: "welcome"
+  from: PeerId
+  /** Transport/feature capabilities this side offers (e.g. `["ws","rtc"]`). */
+  caps: string[]
+}
+
 /** Peer-exchange: share known-peer ids so one bootstrap connection fans out. */
 export interface GossipFrame {
   v: typeof WIRE_VERSION
@@ -176,6 +190,7 @@ export type Frame =
   | SubFrame
   | PubFrame
   | GossipFrame
+  | WelcomeFrame
   | SigRelayFrame
   | ChunkFrame
   | PingFrame
@@ -204,6 +219,7 @@ const KINDS: ReadonlySet<string> = new Set<FrameKind>([
   "unsub",
   "pub",
   "gossip",
+  "welcome",
   "sig-relay",
   "chunk",
   "ping",
@@ -299,6 +315,10 @@ export function validateFrame(value: unknown): asserts value is Frame {
       break
     case "gossip":
       valid = Array.isArray(f.peers) && f.peers.every(x => typeof x === "string" && x.length > 0)
+      break
+    case "welcome":
+      valid =
+        str("from") && Array.isArray(f.caps) && f.caps.every(x => typeof x === "string")
       break
     case "chunk":
       valid =

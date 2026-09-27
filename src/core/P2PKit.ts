@@ -6,6 +6,7 @@ import { WebSocketSignalling, type WebSocketSignallingOptions } from "../signall
 import type { SigRelayFrame } from "../wire/index.js"
 import type { RTCBackend, RTCBackendSource } from "../backends/index.js"
 import type { Transport } from "../transports/types.js"
+import { WSTransport, DOOR_MIN_BACKOFF_MS, DOOR_MAX_BACKOFF_MS, type DoorOptions } from "../transports/ws-door.js"
 import type { Frame, BcastFrame, SubFrame, PubFrame, GossipFrame } from "../wire/index.js"
 import { WIRE_VERSION } from "../wire/index.js"
 import type { Discovery, DiscoveryHost } from "../discovery/types.js"
@@ -28,10 +29,12 @@ export interface BroadcastOptions {
 }
 
 /**
- * How to reach the other peers before a link exists. Only the lobby is built in;
- * anything else is a {@link SignallingChannel} you supply yourself.
+ * How to reach the other peers before a link exists. `lobby` joins a signalling
+ * room; `door` attaches to a peer that listens — a bootstrap server whose
+ * WebSocket endpoint is not a relay but one end of a real link, so a cold
+ * client's very first connection is already a mesh membership.
  */
-export type BootstrapSource = { kind: "lobby"; url: string }
+export type BootstrapSource = { kind: "lobby"; url: string } | { kind: "door"; url: string }
 
 export interface P2PKitOptions {
   /** This node's id. Derived from `signer` when given; required otherwise. */
@@ -40,14 +43,18 @@ export interface P2PKitOptions {
   signalling?: SignallingChannel
   /**
    * Bootstrap without building a signalling channel yourself (README §2). Give
-   * this **or** `signalling`. Currently only the WebSocket lobby is built in.
+   * this **or** `signalling`, or neither (a node that only listens — a door
+   * server, say). `kind: "lobby"` joins a signalling room; `kind: "door"` makes
+   * one WebSocket connection to a listening peer and treats it as a first peer.
    *
    * Unlike a hand-rolled `signalling` channel, the bootstrap path owns the
    * whole peering stack: the lobby socket reconnects itself, peer-brokered
    * signalling (README §4.1) keeps handshakes flowing while the lobby is
    * unreachable, and gossip discovery learns the rest of the room from the
-   * peers you already have. Opt out with `brokeredSignalling: false`,
-   * `discovery: false`, or `signallingOptions.reconnect: false`.
+   * peers you already have. On the door path the door socket reconnects itself
+   * with the same backoff, and everything else is ordinary mesh. Opt out with
+   * `brokeredSignalling: false`, `discovery: false`, or
+   * `signallingOptions.reconnect: false`.
    */
   bootstrap?: BootstrapSource
   /** Identity signer; enables verified handshakes, encryption and signed broadcasts. */
@@ -87,6 +94,8 @@ export interface P2PKitOptions {
   brokeredSignalling?: boolean
   /** Options for the lobby built by `bootstrap`. */
   signallingOptions?: WebSocketSignallingOptions
+  /** Options for the door built by a `bootstrap: { kind: "door" }` source. */
+  doorOptions?: DoorOptions
   /** Options for the peer-brokered relay path enabled by `brokeredSignalling`. */
   brokerOptions?: SignalBrokerOptions
   /**
@@ -121,11 +130,11 @@ export type P2PKitEvents<Msg> = {
 }
 
 /**
- * Where the signalling bootstrap stands, independent of any peer link:
- * `connecting` until the lobby has answered or is known unreachable, `up`
- * while the room is reachable, `down` once it has dropped (the mesh keeps
- * working over peer links meanwhile; see README §4.1). A status event fires on
- * every transition, reconnects included.
+ * Where the bootstrap stands, independent of any peer link: `connecting` until
+ * the lobby has answered or the door link is up, `up` while that first route is
+ * reachable, `down` once it has dropped (the mesh keeps working over peer links
+ * meanwhile; see README §4.1). A status event fires on every transition,
+ * reconnects included.
  */
 export type BootstrapStatus = "connecting" | "up" | "down"
 
@@ -133,6 +142,20 @@ const DEFAULT_TTL = 7
 const DEFAULT_DEDUP_WINDOW = 30_000
 const BROADCAST_FRESHNESS_MS = 60_000
 const REPLAY_WINDOW = 1024
+
+/**
+ * A signalling channel that is permanently unreachable. A door kit has no lobby
+ * for signals to pass through, so this only exists to give the broker something
+ * to hold: {@link SignalBroker.markLobbyDown} is called the moment it is built,
+ * and from then on every outbound signal takes the peer-relay path.
+ */
+const DOOR_UPSTREAM: SignallingChannel = {
+  // Never resolves, so nothing ever mistakes the door for a lobby that
+  // answered; `markLobbyDown` settles the broker's own `ready`.
+  ready: new Promise<void>(() => {}),
+  send: () => {},
+  onMessage: () => () => {},
+}
 
 /**
  * Connects you to a mesh of peers and hands you each one as it joins,
@@ -146,7 +169,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
 
   private readonly options: P2PKitOptions
   private readonly signer: Signer | undefined
-  private readonly signalling: SignallingChannel
+  private readonly signalling: SignallingChannel | undefined
   private readonly broker?: SignalBroker
   private readonly lobby?: WebSocketSignalling
   private readonly emitter = new Emitter<P2PKitEvents<Msg>>()
@@ -162,10 +185,20 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
   private _self?: PeerId
   private started = false
 
+  // Door attach state. The door is a bootstrap source, not a channel: one link
+  // to one always-on peer, retried with backoff for as long as the kit runs.
+  private readonly door?: { kind: "door"; url: string }
+  private doorPeer?: PeerId
+  private doorAttempts = 0
+  private doorRetryTimer?: ReturnType<typeof setTimeout>
+  private doorStopped = false
+
   // Signalling-bootstrap liveness, separate from peer link state: only defined
   // while a broker exists to observe the channel (the bootstrap path always has
-  // one; a self-supplied channel reports through markSignallingUp/Down).
-  private bootstrapStatusValue?: BootstrapStatus
+  // one; a self-supplied channel reports through markSignallingUp/Down). "none"
+  // is the *no reporter* case — a kit with no bootstrap at all — and is not a
+  // state a reporting kit can be in, so the first report always lands.
+  private bootstrapStatusValue: BootstrapStatus | "none" = "none"
   private readonly bootstrapStatusHandlers = new Set<(status: BootstrapStatus) => void>()
 
   // Broadcast dedup + signed-broadcast replay tracking.
@@ -190,8 +223,12 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     let broker: SignalBroker | undefined
     let lobby: WebSocketSignalling | undefined
     const source = options.bootstrap
-    if (!options.signalling && source) {
-      if (source.kind !== "lobby") throw new Error(`unsupported bootstrap kind: ${source.kind}`)
+    if (source && source.kind !== "lobby" && source.kind !== "door") {
+      throw new Error(`unsupported bootstrap kind: ${(source as { kind: string }).kind}`)
+    }
+    const door = source?.kind === "door" ? source : undefined
+    this.door = door
+    if (!options.signalling && source && !door) {
       // The bootstrap lobby owns its own lifecycle: it reconnects with capped
       // backoff, and each drop/open is what flips the kit between the lobby and
       // the brokered relay path.
@@ -209,20 +246,33 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
       })
       this.lobby = lobby
     }
-    const upstream = options.signalling ?? lobby
-    if (!upstream) throw new Error("P2PKit requires `signalling` or a `bootstrap` source")
-    // Brokered signalling is the bootstrap default; a self-supplied channel
-    // stays a pure pass-through unless it opts in.
-    if (options.brokeredSignalling ?? lobby !== undefined) {
+    // A door has no lobby for signals to pass through, so the broker is built
+    // over a channel that is already down: every outbound signal goes straight
+    // to the peer-relay path, which is what makes a brokered handshake through
+    // the door peer work with no other carrier at all. The same is true of a
+    // node that only listens — a door host is exactly that, and carrying its
+    // clients' handshakes to each other is the whole point of it.
+    const upstream = options.signalling ?? lobby ?? DOOR_UPSTREAM
+    // Brokered signalling is the default for every path the kit built itself;
+    // a self-supplied channel stays a pure pass-through unless it opts in.
+    if (options.brokeredSignalling ?? (options.signalling === undefined)) {
       broker = new SignalBroker(upstream, this, options.brokerOptions)
+      // No lobby to wait for on the door paths: their carrier is a peer link.
+      if (!lobby) broker.markLobbyDown()
       this.broker = broker
       this.signalling = broker
-      this.bootstrapStatusValue = "connecting"
       // The first settle tells us whether the lobby ever answered; after that,
-      // transitions arrive through onLobbyUp/Down and markSignallingUp/Down.
-      broker.ready.then(() =>
-        this.setBootstrapStatus(broker!.lobbyAlive ? "up" : "down"),
-      )
+      // transitions arrive through onLobbyUp/Down and markSignallingUp/Down. The
+      // door path reports through its own attach loop instead — its "lobby" is
+      // the door link, and it starts pending, not answered. A node with no
+      // bootstrap at all has nothing to report on and stays undefined.
+      if (lobby) {
+        broker.ready.then(() =>
+          this.setBootstrapStatus(broker!.lobbyAlive ? "up" : "down"),
+        )
+      } else if (door) {
+        this.bootstrapStatusValue = "connecting"
+      }
     } else {
       this.signalling = upstream
     }
@@ -234,9 +284,12 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     this.pubDedup = new SeenCache(dedupWindow)
     const d = options.discovery
     this.discoveries = d === undefined || d === false ? [] : Array.isArray(d) ? d : [d]
-    // Gossip is how the bootstrap mesh learns peers the lobby never named; a
-    // self-supplied channel composes nothing the caller did not ask for.
-    if (lobby && d !== false) this.discoveries.unshift(new GossipDiscovery())
+    // Gossip is how a kit learns peers it was never named. On every path the kit
+    // built for itself — lobby, door, or a node that only listens — one link
+    // fans out into a real mesh, and for a door server that is what introduces
+    // its clients to each other. A self-supplied channel composes nothing the
+    // caller did not ask for.
+    if (!options.signalling && d !== false) this.discoveries.unshift(new GossipDiscovery())
   }
 
   get selfId(): PeerId {
@@ -253,7 +306,14 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     this.emitter.on(event, handler)
   }
 
-  /** Join the mesh: peers start connecting. */
+  /**
+   * Join the mesh: peers start connecting.
+   *
+   * On the `door` path this resolves once the attach loop is *running* rather
+   * than once the link is up — a door that is down must not hang `start()`, and
+   * the loop keeps retrying. Watch {@link bootstrapStatus} (or `peers`) to learn
+   * when the link actually came up.
+   */
   async start(): Promise<void> {
     if (this.started) return
     this.started = true
@@ -263,19 +323,44 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     if (this.options.signedBroadcasts && (!this.signer || this.signer instanceof NoopSigner)) {
       throw new Error("`signedBroadcasts` requires a `signer`")
     }
-    await this.signalling.ready
-    this.signalling.onMessage(message => this.onSignal(message))
-    this.signalling.send({ announce: true, from: this._self })
+    if (this.signalling) {
+      await this.signalling.ready
+      this.signalling.onMessage(message => this.onSignal(message))
+      this.signalling.send({ announce: true, from: this._self })
+    }
     for (const discovery of this.discoveries) await discovery.start(this)
+    if (this.door) void this.attachDoor()
   }
 
   /** Stop the node and close every connection. */
   stop(): void {
+    this.doorStopped = true
+    if (this.doorRetryTimer !== undefined) {
+      clearTimeout(this.doorRetryTimer)
+      this.doorRetryTimer = undefined
+    }
     for (const discovery of this.discoveries) discovery.stop()
     for (const peer of this.peers.values()) peer.disconnect()
     this.peers.clear()
     this.broker?.stop()
     this.lobby?.close()
+  }
+
+  /**
+   * Adopt an already-open link as a direct peer connection. This is how a door
+   * server turns an accepted WebSocket into a mesh membership — {@link
+   * ../transports/ws-door-acceptor.DoorAcceptor} calls it — and how any other
+   * transport you opened yourself joins the mesh.
+   *
+   * Replaces an existing link to the same peer: a fresh socket is strictly
+   * newer evidence than the one it displaced, and keeping the stale one would
+   * strand the newcomer outside the mesh.
+   */
+  acceptLink(transport: Transport<Frame>): void {
+    const remote = transport.remote
+    const existing = this.peers.get(remote)
+    if (existing) existing.disconnect()
+    this.ensurePeer(remote, transport)
   }
 
   /** Flood a message across the whole mesh (README §1). */
@@ -306,15 +391,15 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
       const isNew = !this.peers.has(message.from)
       this.ensurePeer(message.from)
       // Re-announce so the newcomer learns about us too.
-      if (isNew && this._self) this.signalling.send({ announce: true, from: this._self })
+      if (isNew && this._self) this.signalling?.send({ announce: true, from: this._self })
     }
   }
 
-  private ensurePeer(remote: PeerId): void {
+  private ensurePeer(remote: PeerId, transport?: Transport<Frame>): void {
     if (!this._self || remote === this._self || this.peers.has(remote)) return
     if (this.options.maxPeers !== undefined && this.peers.size >= this.options.maxPeers) return
 
-    const injected = this.options.createTransport?.({
+    const injected = transport ?? this.options.createTransport?.({
       self: this._self,
       remote,
       initiator: this._self < remote,
@@ -342,9 +427,70 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
     // peer only while it is still the object stored there.
     peer.on("disconnect", () => {
       if (this.peers.get(remote) === peer) this.peers.delete(remote)
+      if (this.door && remote === this.doorPeer) {
+        // The door link is the bootstrap: without it no new peer is ever
+        // learned, so bring it back rather than wait to be told.
+        this.doorPeer = undefined
+        this.setBootstrapStatus("down")
+        this.scheduleDoorRetry()
+      }
     })
     peer.on("error", err => this.emitter.emit("error", err))
     this.emitter.emit("peer", peer)
+  }
+
+  // ---- door attach ------------------------------------------------------
+
+  /**
+   * Make the door our first peer. One attempt; a failure schedules the next.
+   * The transport resolves only once the door has named itself, which is what
+   * lets the link be keyed like any other peer's.
+   */
+  private async attachDoor(): Promise<void> {
+    const door = this.door
+    if (!door || this.doorStopped || !this._self) return
+    const opts = this.options.doorOptions
+    try {
+      const transport = await WSTransport.open({
+        url: door.url,
+        self: this._self,
+        WebSocket: opts?.WebSocket,
+        caps: opts?.caps,
+        keepAliveMs: opts?.keepAliveMs,
+        keepAliveTimeoutMs: opts?.keepAliveTimeoutMs,
+        identifyTimeoutMs: opts?.identifyTimeoutMs,
+      })
+      if (this.doorStopped) {
+        transport.disconnect()
+        return
+      }
+      this.doorAttempts = 0
+      this.doorPeer = transport.remote
+      this.acceptLink(transport)
+      this.setBootstrapStatus("up")
+      return
+    } catch {
+      // A door that is down is a normal condition, not an error: say so once
+      // through the status and let the backoff do the rest. Shouting here would
+      // spam every listener for the whole outage.
+      this.setBootstrapStatus("down")
+    }
+    this.scheduleDoorRetry()
+  }
+
+  private scheduleDoorRetry(): void {
+    if (this.doorStopped || this.doorRetryTimer !== undefined) return
+    const min = this.options.doorOptions?.minBackoffMs ?? DOOR_MIN_BACKOFF_MS
+    const max = this.options.doorOptions?.maxBackoffMs ?? DOOR_MAX_BACKOFF_MS
+    const delay = Math.min(max, min * 2 ** Math.min(this.doorAttempts, 6))
+    this.doorAttempts += 1
+    this.doorRetryTimer = setTimeout(() => {
+      this.doorRetryTimer = undefined
+      void this.attachDoor()
+    }, delay)
+    if (typeof this.doorRetryTimer === "object" && "unref" in this.doorRetryTimer) {
+      ;(this.doorRetryTimer as { unref: () => void }).unref()
+    }
   }
 
   // ---- discovery (DiscoveryHost) ---------------------------------------
@@ -392,12 +538,14 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
    * No-op without `brokeredSignalling`.
    */
   markSignallingDown(): void {
-    if (this.broker) this.onLobbyDown()
+    if (this.broker && !this.door) this.onLobbyDown()
   }
 
   /** Report the signalling channel reachable again (see {@link markSignallingDown}). */
   markSignallingUp(): void {
-    if (this.broker) this.onLobbyUp()
+    // A door kit has no lobby to come back: letting `lobbyUp` flip would send
+    // signals into a channel that swallows them, so the relay path must stay.
+    if (this.broker && !this.door) this.onLobbyUp()
   }
 
   /**
@@ -407,7 +555,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
    * a property of {@link peers}, never of this.
    */
   get bootstrapStatus(): BootstrapStatus | undefined {
-    return this.bootstrapStatusValue
+    return this.bootstrapStatusValue === "none" ? undefined : this.bootstrapStatusValue
   }
 
   /** Subscribe to bootstrap status transitions; the current value is in {@link bootstrapStatus}. */
@@ -417,7 +565,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
   }
 
   private setBootstrapStatus(status: BootstrapStatus): void {
-    if (this.bootstrapStatusValue === undefined || this.bootstrapStatusValue === status) return
+    if (this.bootstrapStatusValue === status) return
     this.bootstrapStatusValue = status
     for (const handler of [...this.bootstrapStatusHandlers]) handler(status)
   }
@@ -445,7 +593,7 @@ export class P2PKit<Msg = unknown> implements TopicHost, DiscoveryHost, SignalBr
    * Announcing again is the way to be seen a second time. No-op before `start`.
    */
   announce(): void {
-    if (this.started && this._self) this.signalling.send({ announce: true, from: this._self })
+    if (this.started && this._self) this.signalling?.send({ announce: true, from: this._self })
   }
 
   /** The lobby is (back) reachable: pass signals through again and rejoin the room. */
