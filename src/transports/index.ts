@@ -1,4 +1,4 @@
-export type { Transport, TransportEvents } from "./types.js"
+export type { Transport, TransportEvents, TransportInfo } from "./types.js"
 export {
   RTCTransport,
   RTCTransportConnectTimeoutError,

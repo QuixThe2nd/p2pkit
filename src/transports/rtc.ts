@@ -1,4 +1,4 @@
-import type { Transport, TransportEvents } from "./types.js"
+import type { Transport, TransportEvents, TransportInfo } from "./types.js"
 import type { SignallingChannel, SignallingMessage } from "../signalling/types.js"
 import type { RTCBackend } from "../backends/index.js"
 import type { PeerId } from "../utils/types.js"
@@ -282,6 +282,8 @@ interface ChannelState {
 export class RTCTransport<T = unknown> implements Transport<T> {
   readonly remote: PeerId
   readonly name = "rtc"
+  /** An ICE-negotiated data channel has no handshake role to report. */
+  readonly info: TransportInfo = { scheme: "rtc" }
 
   private readonly self: PeerId
   private readonly signalling: SignallingChannel

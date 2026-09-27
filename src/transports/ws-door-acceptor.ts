@@ -184,6 +184,11 @@ export class DoorAcceptor {
     const options: WSTransportOptions = {
       socket,
       self: selfId,
+      // The acceptor owns the HTTP(S) server, so only it knows whether *this*
+      // end terminates TLS. A proxy doing the termination in front of a plain
+      // door leaves the local link `ws` — and that is what is reported, not
+      // the scheme the client believes it dialled.
+      scheme: this.options.tls ? "wss" : "ws",
       caps: this.options.caps,
       keepAliveMs: this.options.keepAliveMs,
       keepAliveTimeoutMs: this.options.keepAliveTimeoutMs,

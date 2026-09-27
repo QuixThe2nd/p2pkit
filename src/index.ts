@@ -32,4 +32,5 @@ export {
   type DoorSocket,
   type DoorAcceptorOptions,
   type DoorHost,
+  type TransportInfo,
 } from "./transports/index.js"

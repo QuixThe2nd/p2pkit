@@ -1,5 +1,5 @@
 import type { PeerId } from "../utils/types.js"
-import type { Transport, TransportEvents } from "./types.js"
+import type { Transport, TransportEvents, TransportInfo } from "./types.js"
 import { Emitter } from "../utils/emitter.js"
 import type { Frame, WelcomeFrame } from "../wire/index.js"
 import { WIRE_VERSION, FrameCodec } from "../wire/index.js"
@@ -35,6 +35,15 @@ export interface WSTransportOptions {
   url?: string
   /** An already-accepted socket to wrap instead of dialing. */
   socket?: DoorSocket
+  /**
+   * The scheme this end of the link is actually carried over, as this side
+   * alone can know it. A dialling end defaults to its own URL's scheme
+   * (`ws://` or `wss://`). An accepted socket has no URL to read, so it
+   * defaults to `ws` — and an acceptor that terminates TLS itself must say
+   * `wss` here, because only it knows. A proxy terminating TLS in front of a
+   * plain door leaves the door's local link `ws`, truthfully.
+   */
+  scheme?: string
   /** Override the WebSocket constructor (defaults to native, then the `ws` package). */
   WebSocket?: DoorSocketCtor
   /** Register the WS-pong listener (see {@link DoorSocket.ping}). */
@@ -70,6 +79,17 @@ const DEFAULT_CAPS = ["ws"]
 async function loadWs(): Promise<DoorSocketCtor> {
   const spec = "ws"
   return ((await import(/* @vite-ignore */ spec)).default as unknown) as DoorSocketCtor
+}
+
+/**
+ * The scheme a dialled URL names, which is the truth about how that dial is
+ * carried. An accepted socket passes `undefined` — there is no URL to read, so
+ * the answer has to come from whoever owns the server that accepted it.
+ */
+function schemeOf(url: string | undefined): string {
+  if (url === undefined) return "ws"
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url.trim())?.[1]
+  return scheme === undefined || scheme === "" ? "ws" : scheme.toLowerCase()
 }
 
 /** First door reconnect delay in ms; doubles each attempt. */
@@ -118,6 +138,14 @@ export class WSTransport implements Transport<Frame> {
   readonly name = "ws"
 
   /**
+   * The local end of this link: which scheme carries it here, and whether this
+   * side dialled or accepted. Fixed at construction, because both facts are
+   * settled the moment the socket exists — the welcome exchange that follows
+   * changes nothing about how the frames are being carried.
+   */
+  readonly info: TransportInfo
+
+  /**
    * Resolves with the counterpart's id once its `welcome` arrives, and rejects
    * if the socket dies first. The door side needs this before it can key the
    * link; {@link WSTransport.open} awaits it so callers get a usable transport.
@@ -142,6 +170,10 @@ export class WSTransport implements Transport<Frame> {
 
   constructor(options: WSTransportOptions) {
     this.options = options
+    this.info = {
+      scheme: options.scheme ?? schemeOf(options.url),
+      role: options.socket !== undefined ? "server" : "client",
+    }
     let resolve!: (remote: PeerId) => void
     let reject!: (err: Error) => void
     this.identified = new Promise<PeerId>((res, rej) => {
